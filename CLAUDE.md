@@ -157,6 +157,44 @@ Conseguenze da tenere presenti se si tocca lo script:
   sempre che il backend si sta riavviando, e un VCL senza backend non
   compila nemmeno.
 
+### Lo stesso ciclo sorveglia anche il template del VCL
+
+Gli indirizzi non sono l'unica cosa che cambia sotto ai piedi di Varnish.
+Il template arriva da un **bind mount** del repository (`docker-compose.yml`
+lo monta `:ro`), quindi un redeploy lo riscrive sul posto senza ricreare
+il container Varnish — e Varnish compila il VCL una volta sola all'avvio.
+
+Il risultato è la peggiore delle asimmetrie: le modifiche a nginx partono
+da sole, perché `nginx/snippets/` e `nginx/templates/` stanno
+**nell'immagine** e il redeploy la ricostruisce, mentre quelle al VCL
+restano invisibili. Un deploy sembra riuscito, metà della modifica è
+viva e l'altra metà no. È esattamente come si è manifestata la regola
+sui documenti di discovery: `x-nginx-cache: BYPASS` e `x-cache: HIT`
+sulla stessa richiesta.
+
+Il ciclo confronta quindi anche una firma del template (`md5sum`, con
+ripiego su mtime e dimensione) e ricarica per una qualunque delle due
+ragioni. Tre cose da non perdere se si tocca:
+
+- una firma **vuota** non è una modifica: vuol dire che in quell'istante
+  il file non è leggibile perché lo si sta sostituendo. Si riprova al
+  giro dopo;
+- la firma si aggiorna **anche quando la ricarica fallisce**, o un
+  template che non compila ripeterebbe lo stesso errore ogni
+  `BACKEND_RECHECK_INTERVAL` secondi. Stesso principio del cron: un
+  problema persistente si segnala una volta;
+- l'errore di `vcl.load` si **stampa**, al contrario di quello di
+  `varnishd -C`: qui esce solo la diagnostica del compilatore, che dice
+  quale riga non compila, non i 110 KB di sorgente C.
+
+Verificato facendolo davvero: partito con il template precedente e la
+discovery in `HIT`, sostituito il file sotto a Varnish acceso, e al giro
+successivo la discovery risponde `BYPASS` mentre una pagina cachata prima
+della ricarica torna ancora dalla cache con la **stessa generazione** —
+stesso PID, nessun riavvio. Poi con un template rotto: segnalato una
+volta sola con la riga incriminata, sito ancora in piedi sul VCL
+precedente, e ricarica riuscita appena rimontato quello buono.
+
 ### Il traffico amministrativo non entra in Varnish, e il punto è uno solo
 
 La RAM di Varnish è riservata al traffico anonimo. Chi ha una sessione

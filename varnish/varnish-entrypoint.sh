@@ -249,6 +249,26 @@ annuncia_backend() {
 }
 annuncia_backend "${CURRENT_IPS}"
 
+# Firma del template, per accorgersi che il file montato e' cambiato.
+#
+# Il template arriva da un bind mount del repository: un redeploy lo
+# riscrive sul posto, ma Varnish compila il VCL una volta sola all'avvio
+# e poi non guarda piu' il file. Senza questo confronto una modifica al
+# VCL resta invisibile finche' qualcuno non ricrea il container - ed e'
+# proprio il caso in cui non lo si ricrea, perche' a cambiare e' un file
+# montato e non l'immagine.
+#
+# md5sum e' nell'immagine ufficiale; il ripiego su mtime e dimensione
+# serve solo a non dipendere da quel dettaglio.
+template_sig() {
+    if command -v md5sum > /dev/null 2>&1; then
+        md5sum "${TEMPLATE}" 2>/dev/null | awk '{print $1}'
+    else
+        stat -c '%Y-%s' "${TEMPLATE}" 2>/dev/null
+    fi
+}
+CURRENT_SIG=$(template_sig)
+
 render_vcl "${TARGET}" "${CURRENT_IPS}" || exit 1
 
 # Compilazione di prova: un VCL rotto deve fermare il deploy con l'errore
@@ -362,36 +382,62 @@ while kill -0 "${VARNISHD_PID}" 2>/dev/null; do
     controlla_salute
 
     NUOVI_IPS=$(resolve_backend)
+    NUOVA_SIG=$(template_sig)
 
     # Risoluzione vuota: quasi sempre il backend si sta riavviando. Si
     # tiene il VCL corrente, perche' un VCL senza backend non si puo'
     # nemmeno compilare e perderemmo anche la cache.
     [ -z "${NUOVI_IPS}" ] && continue
-    [ "${NUOVI_IPS}" = "${CURRENT_IPS}" ] && continue
 
-    log "gli indirizzi di '${BACKEND_HOST}' sono cambiati."
-    log "         prima: ${CURRENT_IPS}"
-    log "         ora:   ${NUOVI_IPS}"
+    # Due ragioni indipendenti per rigenerare il VCL, e vanno guardate
+    # insieme: un redeploy che cambia il template ricrea spesso anche il
+    # container WordPress, quindi le due cose arrivano nello stesso giro.
+    MOTIVO=""
+    if [ "${NUOVI_IPS}" != "${CURRENT_IPS}" ]; then
+        MOTIVO="indirizzi"
+        log "gli indirizzi di '${BACKEND_HOST}' sono cambiati."
+        log "         prima: ${CURRENT_IPS}"
+        log "         ora:   ${NUOVI_IPS}"
+    fi
+    # Firma vuota = il file non e' leggibile in questo istante (un
+    # redeploy lo sta sostituendo). Non e' una modifica: si riprova al
+    # giro dopo, quando il mount si e' assestato.
+    if [ -n "${NUOVA_SIG}" ] && [ "${NUOVA_SIG}" != "${CURRENT_SIG}" ]; then
+        MOTIVO="${MOTIVO:+${MOTIVO} e }template"
+        log "il template del VCL e' cambiato sul disco."
+    fi
+    [ -z "${MOTIVO}" ] && continue
+
+    # La firma si aggiorna comunque, riuscita o no la ricarica: un
+    # template che non compila non deve far ripetere lo stesso errore
+    # ogni BACKEND_RECHECK_INTERVAL secondi. Si segnala una volta, e la
+    # correzione - che cambia di nuovo la firma - verra' riprovata.
+    CURRENT_SIG="${NUOVA_SIG}"
 
     NUOVO_VCL="${RUNTIME_DIR}/default.vcl.new"
     if ! render_vcl "${NUOVO_VCL}" "${NUOVI_IPS}"; then
-        warn "rigenerazione del VCL fallita, resto sulla configurazione precedente."
+        warn "rigenerazione del VCL fallita (${MOTIVO}), resto sulla configurazione precedente."
         continue
     fi
 
     ETICHETTA="reload_$(date +%s)"
-    if vadm vcl.load "${ETICHETTA}" "${NUOVO_VCL}" > /dev/null 2>&1 \
+    # L'errore di vcl.load si cattura invece di buttarlo: quando a
+    # cambiare e' il template, quel messaggio e' l'unica cosa che dice
+    # quale riga non compila. Non e' il caso di "varnishd -C", che
+    # stampa 110 KB di sorgente C: qui esce solo la diagnostica.
+    if ERRORE=$(vadm vcl.load "${ETICHETTA}" "${NUOVO_VCL}" 2>&1) \
        && vadm vcl.use "${ETICHETTA}" > /dev/null 2>&1; then
         mv "${NUOVO_VCL}" "${TARGET}"
         CURRENT_IPS="${NUOVI_IPS}"
-        log "VCL ricaricato a caldo, cache conservata."
+        log "VCL ricaricato a caldo (${MOTIVO}), cache conservata."
         # Il VCL precedente si scarta solo dopo che il nuovo e' in uso, e
         # solo se non e' ancora in raffreddamento: un fallimento qui non
         # e' un problema, Varnish lo liberera' da solo.
         [ -n "${VCL_PRECEDENTE}" ] && vadm vcl.discard "${VCL_PRECEDENTE}" > /dev/null 2>&1 || true
         VCL_PRECEDENTE="${ETICHETTA}"
     else
-        warn "ricarica del VCL fallita, resto sulla configurazione precedente."
+        warn "ricarica del VCL fallita (${MOTIVO}), resto sulla configurazione precedente."
+        [ -n "${ERRORE}" ] && echo "${ERRORE}" >&2
         rm -f "${NUOVO_VCL}"
     fi
 done
