@@ -35,12 +35,44 @@ final class Stack_Cache {
 	public const QUEUE      = 'stack_cache_preload_queue';
 	public const STATS      = 'stack_cache_stats';
 	public const CRON_HOOK  = 'stack_cache_preload_tick';
+	public const SITEMAP_HOOK = 'stack_cache_collect_sitemap';
+	public const TRASH_HOOK = 'stack_cache_trash_tick';
 	public const MENU_SLUG  = 'stack-cache';
+
+	/**
+	 * Prefisso delle directory di cache messe da parte da
+	 * purge_nginx_all() in attesa di essere rimosse dal cron. Il punto
+	 * iniziale le tiene fuori dai glob ingenui, e il prefisso permette a
+	 * run_trash_batch() di riconoscerle senza tenere un elenco da
+	 * qualche parte.
+	 */
+	private const TRASH_PREFIX = '.purge-';
 
 	private static ?self $instance = null;
 
 	/** @var array<string,mixed> */
 	private array $settings;
+
+	/**
+	 * Lavoro rimandato a fine richiesta.
+	 *
+	 * Ogni invalidazione e' una chiamata di rete: un PURGE a Varnish per
+	 * URL coinvolto, e ce ne sono tanti quanti sono gli archivi che
+	 * mostrano un articolo. Farle mentre la bacheca aspetta significa che
+	 * chi salva un articolo paga il tempo di tutte, e con Varnish
+	 * irraggiungibile paga il timeout di ognuna. Si accumulano qui e si
+	 * eseguono su 'shutdown', dopo che la risposta e' stata mandata.
+	 *
+	 * @var string[]
+	 */
+	private array $pending_urls = array();
+
+	private bool $pending_all = false;
+
+	/** @var string[] URL da mettere in coda di preload alla fine. */
+	private array $pending_preload = array();
+
+	private bool $shutdown_hooked = false;
 
 	public static function instance(): self {
 		return self::$instance ??= new self();
@@ -62,6 +94,8 @@ final class Stack_Cache {
 
 		add_action( 'admin_bar_menu', array( $this, 'admin_bar' ), 100 );
 		add_action( self::CRON_HOOK, array( $this, 'run_preload_batch' ) );
+		add_action( self::SITEMAP_HOOK, array( $this, 'collect_sitemap_now' ) );
+		add_action( self::TRASH_HOOK, array( $this, 'run_trash_batch' ) );
 		add_filter( 'cron_schedules', array( $this, 'add_cron_schedule' ) );
 	}
 
@@ -405,11 +439,42 @@ final class Stack_Cache {
 		return $ok; // gia' assente conta come raggiunto
 	}
 
-	/** @return int numero di file rimossi */
-	public function purge_nginx_all(): int {
+	/**
+	 * Svuota tutta la cache su disco.
+	 *
+	 * La strada normale e' rinominare la directory e ricrearla vuota: una
+	 * sola operazione, indipendente da quante voci ci siano dentro. La
+	 * cache risulta svuotata all'istante - nginx da quel momento scrive
+	 * nella directory nuova - e la rimozione vera dei file, che su una
+	 * cache da 2 GB sono decine di migliaia, la fa il cron a lotti invece
+	 * di tenere ferma la richiesta dell'amministratore.
+	 *
+	 * Rinominare e' sicuro: nginx apre i file di cache per percorso ad
+	 * ogni richiesta, e un file che non trova piu' vale come MISS. E'
+	 * esattamente cio' che succedeva gia' cancellandoli uno per uno, solo
+	 * senza lasciare indietro le directory vuote.
+	 *
+	 * Se la rinomina non riesce - permessi sulla directory padre - si
+	 * ricade sulla cancellazione diretta, che e' il comportamento
+	 * precedente.
+	 *
+	 * @return array{ok:bool, deferred:bool, files:int}
+	 */
+	public function purge_nginx_all(): array {
 		$dir = $this->nginx_dir();
 		if ( ! is_dir( $dir ) ) {
-			return 0;
+			return array( 'ok' => false, 'deferred' => false, 'files' => 0 );
+		}
+
+		$trash = dirname( $dir ) . '/' . self::TRASH_PREFIX . basename( $dir ) . '-' . time();
+		if ( ! file_exists( $trash ) && @rename( $dir, $trash ) ) {
+			// Ricreata subito: fra la rinomina e la prima scrittura di
+			// nginx non deve esserci una finestra senza directory, o
+			// nginx logherebbe un errore per ogni risposta cacheabile.
+			@mkdir( $dir, 0755, true );
+			@chmod( $dir, 0755 );
+			$this->schedule_trash_removal();
+			return array( 'ok' => true, 'deferred' => true, 'files' => 0 );
 		}
 
 		$removed = 0;
@@ -427,9 +492,67 @@ final class Stack_Cache {
 		} catch ( Throwable $e ) {
 			// Una cache parzialmente svuotata e' comunque meglio di un
 			// errore fatale nella bacheca.
-			return $removed;
+			return array( 'ok' => true, 'deferred' => false, 'files' => $removed );
 		}
-		return $removed;
+		return array( 'ok' => true, 'deferred' => false, 'files' => $removed );
+	}
+
+	/** @param array{ok:bool, deferred:bool, files:int} $r */
+	private function nginx_purge_detail( array $r ): string {
+		if ( ! $r['ok'] ) {
+			return 'directory non trovata';
+		}
+		return $r['deferred']
+			? 'svuotata (i file vengono rimossi in sottofondo)'
+			: sprintf( '%d file rimossi', $r['files'] );
+	}
+
+	private function schedule_trash_removal(): void {
+		if ( ! wp_next_scheduled( self::TRASH_HOOK ) ) {
+			wp_schedule_single_event( time(), self::TRASH_HOOK );
+		}
+		$this->ensure_cron();
+	}
+
+	/**
+	 * Rimuove a lotti le directory di cache messe da parte.
+	 *
+	 * Un tetto per esecuzione, e si riprogramma da sola finche' non ha
+	 * finito: cosi' anche una cache enorme non trasforma un giro di cron
+	 * in un processo che macina per minuti.
+	 */
+	public function run_trash_batch(): void {
+		$budget = 5000;
+		$base   = dirname( $this->nginx_dir() );
+
+		$trashes = glob( $base . '/' . self::TRASH_PREFIX . '*', GLOB_ONLYDIR );
+		if ( ! $trashes ) {
+			return;
+		}
+
+		foreach ( $trashes as $trash ) {
+			try {
+				$it = new RecursiveIteratorIterator(
+					new RecursiveDirectoryIterator( $trash, FilesystemIterator::SKIP_DOTS ),
+					RecursiveIteratorIterator::CHILD_FIRST
+				);
+				foreach ( $it as $item ) {
+					/** @var SplFileInfo $item */
+					if ( $item->isDir() ) {
+						@rmdir( $item->getPathname() );
+					} else {
+						@unlink( $item->getPathname() );
+					}
+					if ( --$budget <= 0 ) {
+						wp_schedule_single_event( time() + 60, self::TRASH_HOOK );
+						return;
+					}
+				}
+			} catch ( Throwable $e ) {
+				continue;
+			}
+			@rmdir( $trash );
+		}
 	}
 
 	/** @return array{ok:bool, files:int, bytes:int, capped:bool, dir:string} */
@@ -549,10 +672,87 @@ final class Stack_Cache {
 	}
 
 	// =========================================================
+	// Lavoro rimandato a fine richiesta
+	// =========================================================
+
+	/**
+	 * Registra il flush di fine richiesta, una volta sola.
+	 *
+	 * Priorita' massima: cosi' tutto cio' che altri agganciano a
+	 * 'shutdown' - compreso wp_ob_end_flush_all, che e' quello che manda
+	 * davvero il corpo della risposta - e' gia' passato quando iniziamo a
+	 * fare chiamate di rete.
+	 */
+	private function defer(): void {
+		if ( $this->shutdown_hooked ) {
+			return;
+		}
+		$this->shutdown_hooked = true;
+		add_action( 'shutdown', array( $this, 'run_pending' ), PHP_INT_MAX );
+	}
+
+	/**
+	 * Esegue le invalidazioni accumulate durante la richiesta.
+	 *
+	 * Chiamato su 'shutdown'. La prima cosa che fa e' chiudere la
+	 * richiesta FastCGI: da li' in poi il browser ha gia' la sua risposta
+	 * e nessuno sta aspettando, anche se Varnish e' irraggiungibile e ogni
+	 * PURGE va in timeout.
+	 */
+	public function run_pending(): void {
+		if ( ! $this->pending_all && ! $this->pending_urls && ! $this->pending_preload ) {
+			return;
+		}
+
+		// In CLI e nel cron non c'e' nessuna richiesta da chiudere, e
+		// chiuderla in un contesto FPM dove qualcuno deve ancora stampare
+		// qualcosa perderebbe quell'output: si fa solo con una richiesta
+		// web vera, come ultimo agganciato a shutdown.
+		if ( function_exists( 'fastcgi_finish_request' )
+			&& ! ( defined( 'WP_CLI' ) && WP_CLI )
+			&& ! wp_doing_cron() ) {
+			@fastcgi_finish_request();
+		}
+
+		$urls    = $this->pending_urls;
+		$preload = $this->pending_preload;
+		$all     = $this->pending_all;
+
+		// Azzerati prima di eseguire: un fatal a meta' non deve far
+		// ripartire lo stesso lavoro se qualcuno richiama il flush.
+		$this->pending_urls    = array();
+		$this->pending_preload = array();
+		$this->pending_all     = false;
+
+		if ( $all ) {
+			// Lo svuotamento totale rende superflua ogni invalidazione
+			// mirata accumulata nella stessa richiesta.
+			$this->purge_all();
+			return;
+		}
+
+		foreach ( array_unique( $urls ) as $url ) {
+			$this->purge_url_now( (string) $url );
+		}
+
+		if ( $preload && $this->get( 'preload_enabled' ) ) {
+			$this->queue_preload( $preload );
+		}
+	}
+
+	// =========================================================
 	// Invalidazione combinata
 	// =========================================================
 
-	/** @return array<string,mixed> */
+	/**
+	 * Svuota tutto, subito.
+	 *
+	 * Sincrona di proposito: la chiama il pulsante della bacheca, che deve
+	 * poter dire quanti file ha rimosso. Le automazioni usano invece
+	 * queue_purge_all(), che rimanda a fine richiesta.
+	 *
+	 * @return array<string,mixed>
+	 */
 	public function purge_all(): array {
 		$result = array(
 			'varnish' => $this->purge_varnish_all(),
@@ -576,8 +776,34 @@ final class Stack_Cache {
 		return $result;
 	}
 
-	/** Invalida una singola pagina su entrambi i livelli. */
+	/** Come purge_all(), ma a fine richiesta. */
+	public function queue_purge_all(): void {
+		$this->pending_all = true;
+		$this->defer();
+	}
+
+	/** Come purge_everything_including_code(), ma a fine richiesta. */
+	public function queue_purge_everything_including_code(): void {
+		// OPcache e' locale e costa microsecondi: nessun motivo per
+		// rimandarla, e farla subito evita che il resto della richiesta
+		// continui a girare sul bytecode vecchio.
+		$this->purge_opcache();
+		$this->queue_purge_all();
+	}
+
+	/**
+	 * Mette una pagina in coda di invalidazione.
+	 *
+	 * Non fa nulla adesso: il lavoro parte su 'shutdown'. Chi ha bisogno
+	 * dell'effetto immediato (la CLI, un test) chiami purge_url_now().
+	 */
 	public function purge_url( string $url ): void {
+		$this->pending_urls[] = $url;
+		$this->defer();
+	}
+
+	/** Invalida una singola pagina su entrambi i livelli, subito. */
+	public function purge_url_now( string $url ): void {
 		$this->purge_varnish_url( $url );
 		$this->purge_nginx_url( $url );
 		do_action( 'stack_cache_purged_url', $url );
@@ -593,7 +819,7 @@ final class Stack_Cache {
 	 */
 	public function purge_post( int $post_id ): void {
 		if ( 'all' === $this->get( 'purge_scope' ) ) {
-			$this->purge_all();
+			$this->queue_purge_all();
 			return;
 		}
 
@@ -628,6 +854,10 @@ final class Stack_Cache {
 		/** @param string[] $urls */
 		$urls = (array) apply_filters( 'stack_cache_post_urls', array_unique( array_filter( $urls ) ), $post_id );
 
+		// Gli URL si calcolano ADESSO, non a fine richiesta: get_permalink()
+		// e get_term_link() di un contenuto appena cestinato non
+		// restituirebbero piu' lo stesso indirizzo. A essere rimandata e'
+		// solo la parte che parla con la rete.
 		foreach ( $urls as $url ) {
 			$this->purge_url( (string) $url );
 		}
@@ -635,7 +865,8 @@ final class Stack_Cache {
 		$this->bump_stat( 'purge_post' );
 
 		if ( $this->get( 'preload_enabled' ) ) {
-			$this->queue_preload( $urls );
+			$this->pending_preload = array_merge( $this->pending_preload, array_map( 'strval', $urls ) );
+			$this->defer();
 		}
 	}
 
@@ -661,27 +892,31 @@ final class Stack_Cache {
 			add_action( 'edit_comment', array( $this, 'on_comment_edit' ) );
 			add_action( 'wp_set_comment_status', array( $this, 'on_comment_edit' ) );
 		}
+		// Tutte le automazioni passano dalle varianti "queue_": il lavoro
+		// vero parte su 'shutdown'. Un'attivazione di plugin o una
+		// modifica di termine non deve far aspettare la bacheca il tempo
+		// di svuotare quattro livelli di cache.
 		if ( $this->automation_on( 'switch_theme' ) ) {
-			add_action( 'switch_theme', array( $this, 'purge_all' ) );
+			add_action( 'switch_theme', array( $this, 'queue_purge_all' ) );
 		}
 		if ( $this->automation_on( 'plugin_toggle' ) ) {
-			add_action( 'activated_plugin', array( $this, 'purge_everything_including_code' ) );
-			add_action( 'deactivated_plugin', array( $this, 'purge_everything_including_code' ) );
+			add_action( 'activated_plugin', array( $this, 'queue_purge_everything_including_code' ) );
+			add_action( 'deactivated_plugin', array( $this, 'queue_purge_everything_including_code' ) );
 		}
 		if ( $this->automation_on( 'nav_menu' ) ) {
-			add_action( 'wp_update_nav_menu', array( $this, 'purge_all' ) );
+			add_action( 'wp_update_nav_menu', array( $this, 'queue_purge_all' ) );
 		}
 		if ( $this->automation_on( 'term' ) ) {
-			add_action( 'edited_term', array( $this, 'purge_all' ) );
-			add_action( 'created_term', array( $this, 'purge_all' ) );
-			add_action( 'delete_term', array( $this, 'purge_all' ) );
+			add_action( 'edited_term', array( $this, 'queue_purge_all' ) );
+			add_action( 'created_term', array( $this, 'queue_purge_all' ) );
+			add_action( 'delete_term', array( $this, 'queue_purge_all' ) );
 		}
 		if ( $this->automation_on( 'customizer' ) ) {
-			add_action( 'customize_save_after', array( $this, 'purge_all' ) );
+			add_action( 'customize_save_after', array( $this, 'queue_purge_all' ) );
 		}
 		if ( $this->automation_on( 'core_update' ) ) {
-			add_action( 'upgrader_process_complete', array( $this, 'purge_everything_including_code' ) );
-			add_action( '_core_updated_successfully', array( $this, 'purge_everything_including_code' ) );
+			add_action( 'upgrader_process_complete', array( $this, 'queue_purge_everything_including_code' ) );
+			add_action( '_core_updated_successfully', array( $this, 'queue_purge_everything_including_code' ) );
 		}
 	}
 
@@ -764,13 +999,74 @@ final class Stack_Cache {
 		$this->ensure_cron();
 	}
 
-	/** Costruisce la coda a partire dalla sitemap del sito. */
-	public function queue_preload_from_sitemap(): int {
+	/**
+	 * Chiede che la coda venga costruita dalla sitemap.
+	 *
+	 * Non la scarica adesso: l'indice piu' una richiesta per ogni sitemap
+	 * figlia sono decine di chiamate HTTP, e farle dentro alla richiesta
+	 * della bacheca significava tenere l'amministratore fermo su un
+	 * salvataggio per minuti. Qui si programma soltanto: il lavoro lo fa
+	 * il runner del cron, che gira ogni minuto.
+	 */
+	public function queue_preload_from_sitemap(): void {
+		if ( ! wp_next_scheduled( self::SITEMAP_HOOK ) ) {
+			wp_schedule_single_event( time(), self::SITEMAP_HOOK );
+		}
+		$this->ensure_cron();
+	}
+
+	/** Esecuzione vera della raccolta, dal cron. */
+	public function collect_sitemap_now(): void {
 		$urls = $this->collect_sitemap_urls();
 		if ( $urls ) {
 			$this->queue_preload( $urls );
 		}
-		return count( $urls );
+	}
+
+	/**
+	 * Richiesta a nginx nello stesso container, con l'Host del sito.
+	 *
+	 * Stessa strada del preload: non dipende dal DNS pubblico, da Traefik
+	 * ne' dal certificato, e non esce dalla macchina. X-Forwarded-Proto
+	 * serve a far rispondere is_ssl() vero, altrimenti WordPress genera la
+	 * sitemap con URL in http.
+	 *
+	 * @return string corpo della risposta, vuoto se la richiesta fallisce
+	 */
+	private function local_get( string $url, int $timeout = 10 ): string {
+		$parts = wp_parse_url( $url );
+		$host  = strtolower( (string) ( $parts['host'] ?? '' ) );
+
+		// Una sitemap puo' elencare qualunque indirizzo: si seguono solo
+		// quelli di questo sito. Senza il controllo, un plugin SEO
+		// malconfigurato basterebbe a far chiedere a nginx un Host altrui.
+		if ( '' !== $host && $host !== $this->site_host() ) {
+			return '';
+		}
+
+		$path = (string) ( $parts['path'] ?? '/' );
+		if ( ! empty( $parts['query'] ) ) {
+			$path .= '?' . $parts['query'];
+		}
+
+		$res = wp_remote_get(
+			'http://127.0.0.1' . $path,
+			array(
+				'timeout'     => $timeout,
+				'sslverify'   => false,
+				'redirection' => 0,
+				'headers'     => array(
+					'Host'              => $this->site_host(),
+					'X-Stack-Preload'   => '1',
+					'X-Forwarded-Proto' => 'https',
+				),
+			)
+		);
+
+		if ( is_wp_error( $res ) || 200 !== wp_remote_retrieve_response_code( $res ) ) {
+			return '';
+		}
+		return (string) wp_remote_retrieve_body( $res );
 	}
 
 	/** @return string[] */
@@ -778,14 +1074,13 @@ final class Stack_Cache {
 		$urls = array( home_url( '/' ) );
 
 		// Sitemap del core di WordPress: e' un indice di altre sitemap.
-		$index = wp_remote_get( home_url( '/wp-sitemap.xml' ), array( 'timeout' => 10, 'sslverify' => false ) );
-		if ( ! is_wp_error( $index ) && 200 === wp_remote_retrieve_response_code( $index ) ) {
-			$body = (string) wp_remote_retrieve_body( $index );
+		$body = $this->local_get( home_url( '/wp-sitemap.xml' ) );
+		if ( '' !== $body ) {
 			foreach ( $this->extract_locs( $body ) as $sub ) {
 				if ( str_contains( $sub, 'wp-sitemap' ) ) {
-					$child = wp_remote_get( $sub, array( 'timeout' => 10, 'sslverify' => false ) );
-					if ( ! is_wp_error( $child ) && 200 === wp_remote_retrieve_response_code( $child ) ) {
-						$urls = array_merge( $urls, $this->extract_locs( (string) wp_remote_retrieve_body( $child ) ) );
+					$child = $this->local_get( $sub );
+					if ( '' !== $child ) {
+						$urls = array_merge( $urls, $this->extract_locs( $child ) );
 					}
 				} else {
 					$urls[] = $sub;
@@ -962,9 +1257,9 @@ final class Stack_Cache {
 			case 'purge_all':
 				$r       = $this->purge_all();
 				$message = sprintf(
-					'Cache svuotata. Varnish: %s · nginx: %d file · Redis: %s · OPcache: %s',
+					'Cache svuotata. Varnish: %s · nginx: %s · Redis: %s · OPcache: %s',
 					$r['varnish'] ? 'ok' : 'non raggiungibile',
-					(int) $r['nginx'],
+					$this->nginx_purge_detail( $r['nginx'] ),
 					$r['redis'] ? 'ok' : 'non attiva',
 					$r['opcache'] ? 'ok' : 'non disponibile'
 				);
@@ -975,7 +1270,7 @@ final class Stack_Cache {
 				break;
 
 			case 'purge_nginx':
-				$message = sprintf( 'Cache nginx svuotata: %d file rimossi.', $this->purge_nginx_all() );
+				$message = 'Cache nginx: ' . $this->nginx_purge_detail( $this->purge_nginx_all() ) . '.';
 				break;
 
 			case 'purge_redis':
@@ -997,8 +1292,8 @@ final class Stack_Cache {
 				break;
 
 			case 'preload':
-				$n       = $this->queue_preload_from_sitemap();
-				$message = sprintf( 'Preload avviato: %d URL in coda.', $n );
+				$this->queue_preload_from_sitemap();
+				$message = 'Preload programmato: la sitemap viene letta in sottofondo entro un minuto, poi la coda comincia a scorrere.';
 				break;
 
 			case 'save':
