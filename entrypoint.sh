@@ -599,7 +599,197 @@ fi
 [ -f "${WP_ROOT}/wp-config.php" ] && chmod 640 "${WP_ROOT}/wp-config.php"
 
 # =======================================================
-# 6.2 Accesso all'installer
+# 6.2 Dominio: allineamento di un sito gia' installato
+# =======================================================
+# WP_HOME e WP_SITEURL vengono scritti in wp-config.php una volta sola,
+# alla prima installazione: cambiare DOMAIN nel .env non li tocca, e
+# quelle due define VINCONO sui valori nel database. Il sito continua
+# quindi a generare link e redirect verso il dominio vecchio, e nulla lo
+# segnala - si scopre dal browser, a deploy fatto.
+#
+# WP_DOMAIN_SYNC decide cosa fare quando i due non coincidono:
+#
+#   off     (default) lo dice nei log, con le istruzioni. Non scrive nulla.
+#   config  aggiorna le define in wp-config.php e svuota le cache. I link
+#           DENTRO ai contenuti restano al dominio vecchio.
+#   full    come config, piu' una search-replace su tutto il database.
+#
+# "full" riscrive il database, quindi e' opt-in e non parte mai senza
+# aver prima esportato un dump: se qualcosa va storto, il dump e' l'unica
+# strada indietro. Se l'export fallisce, non si tocca niente.
+: "${WP_DOMAIN_SYNC:=off}"
+
+case "${WP_DOMAIN_SYNC}" in
+    off|config|full) ;;
+    *)
+        warn "WP_DOMAIN_SYNC='${WP_DOMAIN_SYNC}' non e' un valore valido (off, config, full): uso 'off'."
+        WP_DOMAIN_SYNC=off
+        ;;
+esac
+
+# Il dominio con cui il sito sta girando davvero. Si legge da
+# wp-config.php, non dal database, perche' e' la define a comandare; il
+# database e' il ripiego per un'installazione che non la usa.
+# "wp config get" non tocca il database, quindi risponde anche a
+# MariaDB irraggiungibile.
+dominio_attuale() {
+    local _v
+    _v="$(timeout 20 /usr/local/bin/wp config get WP_HOME --type=constant 2>/dev/null || true)"
+    if [ -z "${_v}" ]; then
+        _v="$(timeout 20 /usr/local/bin/wp option get home 2>/dev/null || true)"
+    fi
+    # Resta il solo host: niente schema, niente porta, niente percorso.
+    printf '%s' "${_v}" \
+        | sed -e 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' -e 's#/.*$##' -e 's#:[0-9]*$##'
+}
+
+svuota_cache_dominio() {
+    timeout 60 /usr/local/bin/wp cache flush >/dev/null 2>&1 \
+        && log "  object cache svuotata." \
+        || warn "  object cache non svuotata (Redis irraggiungibile?)."
+
+    if [ -d "${FASTCGI_CACHE_DIR}" ]; then
+        find "${FASTCGI_CACHE_DIR}" -mindepth 1 -delete 2>/dev/null || true
+        log "  cache di pagina su disco svuotata."
+    fi
+
+    # Varnish sta in un altro container e puo' non essere ancora in
+    # piedi: best effort, con un timeout corto. Se non risponde, o e'
+    # appena partito (cache vuota) o lo si svuota dalla bacheca.
+    _ban_headers=(-H "Host: ${DOMAIN}" -H "X-Ban-Expression: ." -H "X-Forwarded-Proto: https")
+    [ -n "${PURGE_TOKEN:-}" ] && _ban_headers+=(-H "X-Purge-Token: ${PURGE_TOKEN}")
+    if curl -fsS -m 3 -X BAN "${_ban_headers[@]}" "http://${VARNISH_HOST:-varnish}/" >/dev/null 2>&1; then
+        log "  cache di Varnish invalidata."
+    else
+        warn "  Varnish non raggiungibile: se era gia' in piedi, svuotalo dalla bacheca."
+    fi
+}
+
+if [ -f "${WP_ROOT}/wp-config.php" ]; then
+    DOMINIO_VECCHIO="$(dominio_attuale)"
+else
+    DOMINIO_VECCHIO=""
+fi
+
+if [ -n "${DOMINIO_VECCHIO}" ] && [ "${DOMINIO_VECCHIO}" != "${DOMAIN}" ]; then
+
+    warn "il sito gira su '${DOMINIO_VECCHIO}', ma DOMAIN dice '${DOMAIN}'."
+
+    # Un DOMAIN non impostato vale "localhost" per via del default in
+    # cima a questo script. Prenderlo per buono vorrebbe dire riscrivere
+    # il database di un sito vero verso localhost per una variabile
+    # dimenticata: non si fa, in nessuna modalita'.
+    if [ "${DOMAIN}" = "localhost" ]; then
+        warn "         DOMAIN non e' impostato (vale 'localhost'): non tocco niente."
+        warn "         Impostalo nel .env, o il sito resta su '${DOMINIO_VECCHIO}'."
+        WP_DOMAIN_SYNC=off
+    fi
+
+    case "${WP_DOMAIN_SYNC}" in
+        off)
+            warn "         WP_DOMAIN_SYNC=off: wp-config.php non viene toccato e il sito"
+            warn "         continuera' a rimandare a '${DOMINIO_VECCHIO}'."
+            warn "         Per farlo fare all'avvio: WP_DOMAIN_SYNC=full (riscrive il"
+            warn "         database, dopo un dump) oppure =config (solo le define)."
+            ;;
+
+        config|full)
+            if ! timeout 20 /usr/local/bin/wp core is-installed >/dev/null 2>&1; then
+                warn "         sito non installato o database irraggiungibile: rimando al prossimo avvio."
+            else
+                log "Allineamento del dominio: ${DOMINIO_VECCHIO} -> ${DOMAIN} (WP_DOMAIN_SYNC=${WP_DOMAIN_SYNC})"
+                SYNC_OK=1
+
+                if [ "${WP_DOMAIN_SYNC}" = "full" ]; then
+                    # Il dump PRIMA di qualunque scrittura, e fuori dalla
+                    # docroot: contiene gli hash delle password.
+                    BACKUP_DIR="${WP_BASE}/backups"
+                    mkdir -p "${BACKUP_DIR}"
+                    chown www-data:www-data "${BACKUP_DIR}" 2>/dev/null || true
+                    BACKUP_FILE="${BACKUP_DIR}/pre-dominio-${DOMINIO_VECCHIO}-$(date +%Y%m%d-%H%M%S).sql"
+
+                    log "  dump del database in ${BACKUP_FILE}..."
+                    if timeout 600 /usr/local/bin/wp db export "${BACKUP_FILE}" >/dev/null 2>&1; then
+                        chmod 600 "${BACKUP_FILE}" 2>/dev/null || true
+                        log "  dump riuscito ($(du -h "${BACKUP_FILE}" 2>/dev/null | cut -f1))."
+                    else
+                        warn "  DUMP FALLITO: non riscrivo il database. Il sito resta su '${DOMINIO_VECCHIO}'."
+                        rm -f "${BACKUP_FILE}"
+                        SYNC_OK=0
+                    fi
+
+                    if [ "${SYNC_OK}" = "1" ]; then
+                        # Si sostituisce "//vecchio", non "https://vecchio":
+                        # cosi' cadono insieme http://, https:// e i link
+                        # protocol-relative, in una passata sola.
+                        #
+                        # --skip-columns=guid non e' opzionale: i GUID dei
+                        # contenuti sono identificatori storici, non
+                        # indirizzi, e i lettori di feed si accorgono se
+                        # cambiano.
+                        #
+                        # L'output va in un file invece che in una pipe:
+                        # in pipe l'esito del comando sarebbe quello di
+                        # "sed", e la riuscita dipenderebbe da pipefail.
+                        # Una search-replace fallita che risulta riuscita
+                        # e' esattamente il guasto da non avere qui.
+                        log "  search-replace su tutte le tabelle..."
+                        SR_LOG="$(mktemp)"
+                        if timeout 1800 /usr/local/bin/wp search-replace \
+                                "//${DOMINIO_VECCHIO}" "//${DOMAIN}" \
+                                --all-tables --precise --skip-columns=guid \
+                                --report-changed-only > "${SR_LOG}" 2>&1; then
+                            sed 's/^/     /' "${SR_LOG}"
+                            log "  database allineato."
+                        else
+                            sed 's/^/     /' "${SR_LOG}" >&2
+                            warn "  SEARCH-REPLACE FALLITA. Il dump e' in ${BACKUP_FILE}."
+                            warn "  wp-config.php non viene toccato, cosi' al prossimo avvio si riprova."
+                            SYNC_OK=0
+                        fi
+                        rm -f "${SR_LOG}"
+                    fi
+                fi
+
+                # Le define per ultime, e solo se tutto il resto e'
+                # andato: sono loro il marcatore di "dominio corrente".
+                # Finche' restano vecchie, un avvio successivo riprova;
+                # aggiornarle dopo un fallimento vorrebbe dire un sito a
+                # meta' che non si segnala piu'.
+                if [ "${SYNC_OK}" = "1" ]; then
+                    /usr/local/bin/wp config set WP_HOME    "https://${DOMAIN}" >/dev/null
+                    /usr/local/bin/wp config set WP_SITEURL "https://${DOMAIN}" >/dev/null
+                    log "  WP_HOME e WP_SITEURL aggiornate."
+
+                    # Prefissi di chiave: si spostano solo se erano il
+                    # dominio vecchio, cioe' se li aveva scritti questo
+                    # entrypoint. Cambiarli equivale a buttare l'object
+                    # cache, che tanto va buttata comunque.
+                    for _c in WP_REDIS_PREFIX WP_CACHE_KEY_SALT; do
+                        if [ "$(/usr/local/bin/wp config get "${_c}" --type=constant 2>/dev/null || true)" = "${DOMINIO_VECCHIO}" ]; then
+                            /usr/local/bin/wp config set "${_c}" "${DOMAIN}" >/dev/null
+                        fi
+                    done
+
+                    svuota_cache_dominio
+
+                    if [ "${WP_DOMAIN_SYNC}" = "config" ]; then
+                        warn "  WP_DOMAIN_SYNC=config: i link dentro ai contenuti puntano ancora a"
+                        warn "  '${DOMINIO_VECCHIO}'. Per spostarli: WP_DOMAIN_SYNC=full, oppure"
+                        warn "  wp search-replace '//${DOMINIO_VECCHIO}' '//${DOMAIN}' --all-tables --precise --skip-columns=guid"
+                    fi
+
+                    log "Dominio allineato. Ricordati del dominio nuovo anche su Dokploy (rotta e certificato)."
+                    log "  Rimetti WP_DOMAIN_SYNC=off: fatto il trasloco, quel valore serve solo a far"
+                    log "  riscrivere il database al prossimo DOMAIN sbagliato per errore."
+                fi
+            fi
+            ;;
+    esac
+fi
+
+# =======================================================
+# 6.3 Accesso all'installer
 # =======================================================
 # Su un sito installato /wp-admin/install.php e /wp-admin/setup-config.php
 # vanno chiusi: sono la porta d'ingresso classica di chi trova un sito con

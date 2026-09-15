@@ -184,6 +184,11 @@ services:
 
       # --- Manutenzione ---
       - WP_AUTO_INSTALL=${WP_AUTO_INSTALL:-1}
+      # Cosa fare quando DOMAIN non coincide piu' con il dominio con cui
+      # il sito e' stato installato: off (solo un avviso nei log), config
+      # (aggiorna le define in wp-config.php), full (anche il database,
+      # dopo un dump). Vedi il .env.example.
+      - WP_DOMAIN_SYNC=${WP_DOMAIN_SYNC:-off}
       # auto: /wp-admin/install.php aperto solo finche' il sito non e'
       # installato, poi 404. deny lo chiude sempre, open lo lascia aperto.
       - WP_INSTALL_ACCESS=${WP_INSTALL_ACCESS:-auto}
