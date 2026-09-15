@@ -221,6 +221,49 @@ sub vcl_recv {
     }
 
     # ---------------------------------------------------
+    # Discovery e endpoint OAuth/MCP: mai da cache
+    # ---------------------------------------------------
+    # I documenti sotto /.well-known/ non sono contenuto: sono la mappa
+    # che un client usa per sapere come parlare con questo sito. Li
+    # chiede una volta, in anonimo e senza cookie, quindi finivano dritti
+    # nel ramo generico piu' in basso e restavano in RAM per VARNISH_TTL
+    # (sei ore di default).
+    #
+    # Il guasto reale che ha prodotto questa regola: l'installazione di
+    # un server MCP su WordPress pubblica in
+    # /.well-known/oauth-protected-resource l'identificatore della
+    # risorsa, che WordPress costruisce con rest_url(). Quel valore
+    # cambia forma con la struttura dei permalink - "/wp-json/mcp/..."
+    # con i permalink leggibili, "/index.php?rest_route=/mcp/..." senza -
+    # e cambiare l'impostazione riscrive tutti gli URL del documento.
+    #
+    # Varnish continuava pero' a servire la copia vecchia, mentre
+    # l'authorization endpoint sta sotto /wp-admin, che non e' mai in
+    # cache e rispondeva quindi con i valori nuovi. Il client leggeva un
+    # identificatore, il server ne calcolava un altro e rifiutava
+    # l'autorizzazione con "The requested resource is not served by this
+    # authorization server". Con sei ore di TTL l'effetto e' per giunta
+    # intermittente: la connessione riesce, poi cade e non si riesce piu'
+    # a rifarla.
+    #
+    # Gli endpoint stessi sono quasi sempre POST o portano Authorization,
+    # quindi passano gia' oltre. Sono elencati lo stesso perche' una GET
+    # anonima ad /wp-json/mcp/... risponde 401, e un 401 memorizzato per
+    # sei ore e' l'ennesima cache che risponde qualcosa che non e' un
+    # errore. Nessuno di questi percorsi ha traffico che valga la RAM.
+    #
+    # Entrambe le forme di URL della REST API vanno coperte: il client
+    # usa quella che ha letto nella discovery, non quella che preferiamo
+    # noi.
+    if (req.url ~ "^/\.well-known/"
+        || req.url ~ "^/wp-json/mcp(/|\?|$)"
+        || req.url ~ "^/wp-json/[^/]+/[^/]+/oauth(/|\?|$)"
+        || req.url ~ "[?&]rest_route=[^&]*(mcp|oauth)") {
+        set req.http.X-Stack-Bypass = "discovery";
+        return (pass);
+    }
+
+    # ---------------------------------------------------
     # Normalizzazione di Accept-Encoding
     # ---------------------------------------------------
     # nginx comprime in zstd, br o gzip e marca la risposta con
