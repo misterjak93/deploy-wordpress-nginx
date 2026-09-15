@@ -82,28 +82,58 @@ Serve un accesso diretto per diagnosi? Aggiungi `dokploy-network` alle reti del 
 
 ### **Cambiare dominio a sito già installato**
 
-`DOMAIN` nel `.env` **non basta**, ed è il punto dove è facile perdere un pomeriggio.
+`DOMAIN` nel `.env` **non basta da solo**, ed è il punto dove è facile perdere un pomeriggio.
 
 `WP_HOME` e `WP_SITEURL` vengono scritti in `wp-config.php` una volta sola, alla prima installazione: l'entrypoint rigenera `wp-config.php` solo se non esiste. Al riavvio con un `DOMAIN` nuovo cambiano il `server_name` di nginx e i messaggi nei log, ma WordPress continua a generare (e a redirezionare verso) il dominio vecchio, perché le due `define` vincono sui valori nel database.
 
-L'ordine che funziona:
+Da qui `WP_DOMAIN_SYNC`, che decide cosa fare quando i due non coincidono:
+
+| Valore | Cosa fa |
+| --- | --- |
+| `off` *(default)* | Lo dice nei log, con le istruzioni. Non scrive niente. |
+| `config` | Aggiorna `WP_HOME` e `WP_SITEURL` e svuota le cache. I link **dentro ai contenuti** restano al dominio vecchio. |
+| `full` | Come `config`, più una `search-replace` su tutto il database. |
+
+Il trasloco completo diventa quindi:
+
+```
+DOMAIN=nuovo.com
+WP_DOMAIN_SYNC=full
+```
+
+redeploy, e il dominio nuovo nella tab **Domains** di Dokploy (la rotta e il certificato restano una cosa sua). Nei log dell'avvio:
+
+```
+[wp] il sito gira su 'vecchio.com', ma DOMAIN dice 'nuovo.com'.
+[wp] Allineamento del dominio: vecchio.com -> nuovo.com (WP_DOMAIN_SYNC=full)
+[wp]   dump del database in /var/www/wordpress/backups/pre-dominio-vecchio.com-20260115-101200.sql...
+[wp]   dump riuscito (24M).
+[wp]   search-replace su tutte le tabelle...
+[wp]   database allineato.
+[wp]   WP_HOME e WP_SITEURL aggiornate.
+[wp]   object cache svuotata.
+[wp]   cache di pagina su disco svuotata.
+[wp]   cache di Varnish invalidata.
+```
+
+Poi **rimetti `WP_DOMAIN_SYNC=off`**: fatto il trasloco, quel valore serve solo a far riscrivere il database al prossimo `DOMAIN` sbagliato per errore.
+
+**Le garanzie, perché `full` riscrive il database.** Esporta un dump *prima* di qualunque scrittura, in `/var/www/wordpress/backups` — fuori dalla docroot, perché contiene gli hash delle password — e se il dump fallisce non tocca niente. Se la `search-replace` fallisce, `wp-config.php` resta com'è: il sito continua a rispondere sul dominio vecchio e al riavvio successivo si riprova, invece di restare a metà. Non parte mai se `DOMAIN` è vuoto, perché il default è `localhost` e una variabile dimenticata riscriverebbe un sito vero verso `localhost`.
+
+Si sostituisce `//vecchio.com`, non `https://vecchio.com`: così cadono insieme `http://`, `https://` e i link protocol-relative. E `--skip-columns=guid` non è facoltativo: i GUID dei contenuti sono identificatori storici, non indirizzi, e i lettori di feed si accorgono se cambiano.
+
+**A mano**, se preferisci vedere ogni passo:
 
 ```bash
-# 1. le due define in wp-config.php, dentro al volume
-docker compose exec wordpress sed -i \
-  "s#https://vecchio.com#https://nuovo.com#g" /var/www/wordpress/html/wp-config.php
-
-# 2. i riferimenti dentro ai contenuti (link, immagini, campi serializzati)
+docker compose exec wordpress wp db export /var/www/wordpress/backups/prima.sql
 docker compose exec wordpress wp search-replace \
-  'https://vecchio.com' 'https://nuovo.com' --all-tables --precise --skip-columns=guid
-
-# 3. cache: i tre livelli hanno ancora dentro il dominio vecchio
+  '//vecchio.com' '//nuovo.com' --all-tables --precise --skip-columns=guid
+docker compose exec wordpress wp config set WP_HOME    https://nuovo.com
+docker compose exec wordpress wp config set WP_SITEURL https://nuovo.com
 docker compose exec wordpress wp cache flush
 ```
 
-Poi `DOMAIN=nuovo.com` nel `.env`, il dominio nuovo nella tab **Domains** di Dokploy (il certificato è legato a quello), e un redeploy. Infine **Svuota tutto** dalla voce Cache in bacheca.
-
-Due dettagli che si notano solo dopo: `WP_REDIS_PREFIX` e `WP_CACHE_KEY_SALT` contengono anch'essi il dominio vecchio — sono solo prefissi di chiavi, quindi cambiarli o lasciarli è indifferente, cambiarli equivale a svuotare l'object cache. E `--skip-columns=guid` non è facoltativo: i GUID dei contenuti sono identificatori storici, non indirizzi, e i lettori di feed si accorgono se cambiano.
+Un dettaglio che si nota solo dopo: `WP_REDIS_PREFIX` e `WP_CACHE_KEY_SALT` contengono anch'essi il dominio. `WP_DOMAIN_SYNC` li sposta, ma solo se valevano esattamente il dominio vecchio — cioè se li aveva scritti l'entrypoint. Sono prefissi di chiavi: spostarli equivale a buttare l'object cache, che tanto va buttata comunque.
 
 ---
 
@@ -633,6 +663,7 @@ Copia `.env.example` e personalizzalo. Le variabili sono raggruppate per area e 
 | `DB_PASS`, `DB_ROOT_PASS` | |
 | `FB_ADMIN_PASSWORD` | Se resta vuota, FileBrowser parte con admin **senza password** |
 | `FIREWALL_BYPASS_COOKIE` | Cambia il valore di esempio |
+| `WP_DOMAIN_SYNC` | `off` / `config` / `full`. Serve solo per spostare un sito gia' installato su un dominio nuovo |
 | `PURGE_TOKEN` | Facoltativo. Segreto per svuotare Varnish; lascialo vuoto se invalidi con un plugin di terze parti |
 | `TRUSTED_PROXIES` | Facoltativo. Gli hop di cui fidarsi per l'IP reale del visitatore; il default copre tutto lo spazio privato |
 

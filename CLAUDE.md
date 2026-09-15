@@ -417,6 +417,36 @@ Fa fallire l'interpolazione con errore, e Dokploy rilegge e riscrive il
 compose per iniettare le label Traefik. Se quel passaggio va in errore il
 container parte comunque, ma senza label: né rotta né certificato.
 
+### Il dominio si sposta in un ordine solo
+
+`WP_HOME` e `WP_SITEURL` stanno in `wp-config.php`, scritte una volta
+sola alla prima installazione, e **vincono sui valori nel database**:
+cambiare `DOMAIN` nel `.env` non sposta il sito, e non lo segnala
+nemmeno. `WP_DOMAIN_SYNC` (`off` | `config` | `full`) lo fa fare
+all'avvio.
+
+L'ordine delle operazioni in `full` non è estetica:
+
+1. **dump del database** in `${WP_BASE}/backups` — fuori dalla docroot,
+   contiene gli hash delle password. Se fallisce, non si tocca niente:
+   una `search-replace` non si annulla;
+2. **`search-replace`** su `//vecchio` → `//nuovo` (senza schema cadono
+   insieme http, https e i link protocol-relative), con
+   `--skip-columns=guid`, che non è opzionale: i GUID sono identificatori
+   storici, non indirizzi;
+3. **solo adesso** le define in `wp-config.php`.
+
+Il terzo passo per ultimo perché quelle define **sono il marcatore** di
+"dominio corrente": finché restano vecchie, l'avvio successivo riprova.
+Aggiornarle dopo un fallimento vorrebbe dire un sito a metà che ha anche
+smesso di segnalarsi.
+
+Due guardie da non togliere: non si parte mai con `DOMAIN` uguale a
+`localhost` (è il default del `.env` dimenticato, e riscriverebbe il
+database di un sito vero), e l'esito della `search-replace` si legge dal
+comando, non da una pipe — in pipe conterebbe l'uscita di `sed`, e una
+migrazione fallita risulterebbe riuscita.
+
 ### Una variabile assente da `environment:` non arriva al container
 
 Per quanto accuratamente sia impostata nel `.env`. Un nuovo knob va
