@@ -233,6 +233,24 @@ sub vcl_recv {
     # massimo quattro copie per oggetto. L'ordine di preferenza arriva dal
     # .env (COMPRESSION_PRIORITY).
     if (req.http.Accept-Encoding) {
+        # Prima si tolgono le codifiche RIFIUTATE.
+        #
+        # Il confronto qui sotto e' per sottostringa, ed e' quello che
+        # rende la normalizzazione economica. Ma "gzip, br;q=0" contiene
+        # "br" pur essendo un rifiuto esplicito di brotli: senza questa
+        # riga quel client riceveva brotli, cioe' una pagina illeggibile.
+        # Raro, e per questo peggiore: si manifesta come "un browser vede
+        # il sito a caratteri strani" e non lascia traccia da nessuna
+        # parte.
+        #
+        # Il confronto finale con (,|$) e' obbligatorio: senza, "q=0.5"
+        # verrebbe letto come "q=0" seguito da spazzatura e la codifica
+        # sparirebbe pur essendo accettata.
+        if (req.http.Accept-Encoding ~ "q=0") {
+            set req.http.Accept-Encoding = regsuball(req.http.Accept-Encoding,
+                "[a-zA-Z0-9_*-]+ *; *q *= *0(\.0+)? *(,|$)", "");
+        }
+
         if (req.url ~ "\.(jpe?g|png|gif|webp|avif|ico|mp4|webm|ogv|mp3|ogg|zip|gz|tgz|bz2|rar|7z|woff2?)(\?.*)?$") {
             # Gia' compressi: ricomprimerli non guadagna niente e
             # moltiplicherebbe le varianti in cache.
@@ -526,6 +544,13 @@ sub vcl_deliver {
     unset resp.http.X-WP-Varnish-TTL;
     unset resp.http.X-Powered-By;
     unset resp.http.Server;
+    # L'hop resta dichiarato, il numero di versione no. Lo stack nasconde
+    # gia' le versioni di nginx e di PHP, e questa riga usciva invece con
+    # "(Varnish/7.7)" su ogni risposta. Toglierla del tutto sarebbe andati
+    # troppo in la': e' l'header che ha permesso di capire, dagli header e
+    # basta, che un 503 su tutto il sito veniva da Varnish senza backend e
+    # non da Traefik.
+    set resp.http.Via = "1.1 varnish";
     unset resp.http.X-Pingback;
     unset resp.http.Link-Template;
 
