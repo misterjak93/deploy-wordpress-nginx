@@ -276,6 +276,31 @@ log "sorveglianza di '${BACKEND_HOST}' ogni ${BACKEND_RECHECK_INTERVAL}s."
 # di tenerne in memoria uno che non servira' mai piu'.
 VCL_PRECEDENTE="boot"
 attesa=0
+backend_giu=0
+
+# Un 503 con Varnish vivo e' il guasto peggiore da diagnosticare: il
+# container risulta sano, l'healthcheck passa, e nei log non c'e' niente
+# che spieghi perche' il sito e' giu'. Succede quando nessun backend
+# supera la probe - per esempio se il nome risolve a container di un
+# altro progetto, che rispondono ma non hanno /healthz. Meglio dirlo.
+controlla_salute() {
+    _lista=$(vadm backend.list 2>/dev/null) || return 0
+    _sani=$(echo "${_lista}" | grep -c 'wp_[0-9][0-9]*  *probe.*healthy' || true)
+    if [ "${_sani}" -eq 0 ]; then
+        if [ "${backend_giu}" -eq 0 ]; then
+            warn "NESSUN backend sano: il sito sta rispondendo 503."
+            warn "         Indirizzi in uso per '${BACKEND_HOST}': ${CURRENT_IPS}"
+            warn "         Se non sono i container di questo progetto, il nome sta"
+            warn "         risolvendo a container omonimi di un altro stack sulla"
+            warn "         stessa dokploy-network."
+            echo "${_lista}" >&2
+            backend_giu=1
+        fi
+    elif [ "${backend_giu}" -eq 1 ]; then
+        log "backend di nuovo raggiungibili (${_sani} sani)."
+        backend_giu=0
+    fi
+}
 
 # Il sonno e' spezzato in tranche da 5s per non ritardare la risposta a
 # SIGTERM: "docker stop" aspetta 10s prima di uccidere il container, e un
@@ -285,6 +310,8 @@ while kill -0 "${VARNISHD_PID}" 2>/dev/null; do
     attesa=$(( attesa + 5 ))
     [ "${attesa}" -lt "${BACKEND_RECHECK_INTERVAL}" ] && continue
     attesa=0
+
+    controlla_salute
 
     NUOVI_IPS=$(resolve_backend)
 
