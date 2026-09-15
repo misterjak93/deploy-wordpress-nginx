@@ -136,6 +136,36 @@ Conseguenze da tenere presenti se si tocca lo script:
   sempre che il backend si sta riavviando, e un VCL senza backend non
   compila nemmeno.
 
+### Il traffico amministrativo non entra in Varnish, e il punto è uno solo
+
+La RAM di Varnish è riservata al traffico anonimo. Chi ha una sessione
+WordPress aperta esce alla prima riga utile di `vcl_recv`, prima di
+qualunque normalizzazione, lookup o chiave: niente oggetto, niente
+hit-for-miss, nemmeno per gli asset. Per la bacheca il livello di cache è
+nginx, che sta su disco.
+
+La regola esiste **una volta sola**, in cima al VCL, e ci sta apposta. Le
+regole più in basso (statici, cookie, percorsi) non la ripetono: sarebbe
+una seconda lista da tenere allineata a mano, e prima o poi una delle due
+resta indietro.
+
+Sta in cima anche perché il blocco degli statici, più sotto, dice «un
+asset non deve mai essere escluso dalla cache per colpa di un cookie».
+Spostarlo sopra al controllo dei cookie — modifica ragionevole a leggerne
+il commento — rimetterebbe in cache le richieste di chi è loggato. Con il
+gate in cima quelle richieste non arrivano nemmeno a leggerlo.
+
+Il marcatore `X-Stack-Bypass` è interno: `vcl_recv` lo azzera prima di
+tutto, così un client non può fabbricarlo, e `vcl_backend_fetch` lo toglie
+prima di parlare con nginx. Serve solo a `vcl_deliver` per emettere
+`X-Cache: BYPASS`.
+
+In `vcl_backend_response` il primo controllo è `bereq.uncacheable`, vero
+per ogni fetch nato da un pass. Oltre a non sprecare lavoro, è una
+correzione: più in basso l'HTML esce con `Cache-Control: public`, che su
+una pagina di `wp-admin` sovrascriverebbe il `no-store` messo apposta dal
+mu-plugin.
+
 ### Il nome del backend deve essere unico su dokploy-network
 
 `dokploy-network` è **condivisa da tutti i progetti** sulla stessa

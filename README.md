@@ -149,6 +149,37 @@ Una pagina in HIT esce in pochi millisecondi senza svegliare né PHP né il data
 - `/cart`, `/checkout`, `/my-account` (e gli equivalenti italiani)
 - media pesanti: video, audio, archivi, PDF — un solo file da 200 MB sfratterebbe migliaia di pagine HTML, e nginx li serve comunque con `sendfile`
 
+### **La RAM è riservata al pubblico**
+
+Le prime due voci della lista non sono una semplice esclusione: chi ha
+una sessione WordPress aperta **esce dalla catena alla prima riga utile
+del VCL**, prima di qualunque normalizzazione, lookup o chiave di cache.
+Varnish per lui è un tubo, e in RAM non resta niente — nemmeno un
+hit-for-miss, nemmeno per i duecento `.css` e `.js` che l'editor a
+blocchi richiede all'apertura.
+
+È una decisione di bilancio. La cache di Varnish è la risorsa più cara
+dello stack e le pagine di un amministratore non potrebbero comunque
+essere condivise con nessun altro: ogni byte speso per loro è sottratto
+alle pagine che i visitatori vedono davvero.
+
+Per l'area di amministrazione il livello di cache è **nginx**, e basta:
+la sua sta su disco, dove lo spazio non è prezioso, e gli asset di
+`wp-admin` li serve con `sendfile` e `open_file_cache` senza mai
+svegliare PHP. Sotto, OPcache e l'object cache Redis — che per una
+bacheca sono i due livelli che contano davvero.
+
+Per il visitatore anonimo invece **non cambia nulla**: Varnish, poi
+nginx, poi PHP.
+
+Si legge dalla risposta: le richieste amministrative escono con
+`X-Cache: BYPASS`, distinto da `MISS` (cercata in cache e non trovata).
+
+```bash
+curl -sI https://tuosito.com/wp-admin/ | grep -i x-cache
+# X-Cache: BYPASS
+```
+
 ### **Cosa viene normalizzato prima della cache**
 
 Tre normalizzazioni che decidono l'hit rate reale:
@@ -305,6 +336,12 @@ curl -sI https://tuosito.com/ | grep -i 'x-cache\|x-nginx-cache\|x-wp-cache-reas
 `X-WP-Cache-Reason` dice **perché** una pagina non è stata memorizzata —
 la domanda più frequente quando una cache "non prende".
 
+`X-Cache` ha tre valori: `HIT`, `MISS` (cercata e non trovata) e
+`BYPASS` (richiesta amministrativa, Varnish non ha nemmeno guardato).
+Su una sessione loggata il primo livello è quindi sempre `BYPASS`: la
+RAM è riservata al traffico anonimo, e per la bacheca il livello di
+cache è nginx.
+
 ### **Il plugin Stack Cache**
 
 Installato come must-use plugin dall'entrypoint: fa parte
@@ -332,6 +369,12 @@ Tre strati indipendenti concordano nel non servire mai una pagina
 personale a un estraneo: il VCL di Varnish, le mappe `$cache_skip` di
 nginx e il plugin, che manda TTL zero. Basta un cookie di sessione, un
 header `Authorization` o un nonce REST.
+
+I tre concordano sulla regola ma non sul ruolo. Varnish quelle richieste
+non le guarda nemmeno: escono in cima al VCL con `X-Cache: BYPASS`, così
+la RAM resta tutta al traffico anonimo. nginx invece le riceve tutte,
+perché è lui a servire l'area di amministrazione — fuori dalla cache di
+pagina, ma con `sendfile` sugli asset e OPcache più Redis sotto.
 
 I cookie di analytics (`_ga`, `_fbp`, consensi) sono invece **ignorati**:
 sono la ragione numero uno per cui una cache di pagina "non prende mai".

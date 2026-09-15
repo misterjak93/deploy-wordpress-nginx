@@ -11,6 +11,11 @@ import directors;
 # Varnish non termina TLS e non deve: lo fa Traefik, che gli passa la
 # richiesta in chiaro sulla rete interna insieme a X-Forwarded-Proto.
 #
+# La RAM di Varnish e' riservata al traffico anonimo. Chi ha una sessione
+# WordPress aperta esce dalla catena alla prima riga utile di vcl_recv:
+# per lui la cache e' quella di nginx, che sta su disco. Vedi il blocco
+# "Traffico amministrativo" piu' in basso.
+#
 # I segnaposto delimitati da chiocciole vengono sostituiti all'avvio
 # da varnish-entrypoint.sh a partire dalle variabili del .env.
 # Il nome del segnaposto non va mai citato in un commento: lo script
@@ -70,6 +75,11 @@ sub vcl_recv {
 
     set req.backend_hint = wp_cluster.backend();
 
+    # Marcatore interno (vedi "Traffico amministrativo" piu' sotto): lo
+    # scrive Varnish, quindi un client che lo mandasse da fuori non deve
+    # poterlo far valere.
+    unset req.http.X-Stack-Bypass;
+
     # ---------------------------------------------------
     # Sonda di salute di Varnish stesso
     # ---------------------------------------------------
@@ -121,6 +131,41 @@ sub vcl_recv {
 
     # Solo GET e HEAD sono cacheabili. Tutto il resto va al backend.
     if (req.method != "GET" && req.method != "HEAD") {
+        return (pass);
+    }
+
+    # ---------------------------------------------------
+    # Traffico amministrativo: fuori da Varnish, subito
+    # ---------------------------------------------------
+    # La cache di Varnish sta in RAM ed e' lo spazio piu' caro dello
+    # stack. Il traffico di chi e' loggato non potrebbe comunque finirci
+    # dentro - e' contenuto personale - quindi ogni byte e ogni ciclo
+    # spesi per lui sono sprecati due volte. Qui esce alla prima
+    # occasione utile: niente normalizzazione, niente lookup, nessun
+    # oggetto, nessun hit-for-miss, nemmeno per gli asset statici che
+    # l'amministratore richiede a centinaia aprendo l'editor a blocchi.
+    #
+    # Per l'area di amministrazione il livello di cache e' nginx, ed e'
+    # sufficiente: la sua cache sta su disco, dove lo spazio non e'
+    # prezioso, e gli asset di wp-admin li serve con sendfile e
+    # open_file_cache senza mai svegliare PHP. Sotto nginx restano
+    # OPcache e l'object cache Redis, che sono i due livelli che contano
+    # davvero per una bacheca. Per il visitatore anonimo invece non
+    # cambia nulla: Varnish, poi nginx, poi PHP.
+    #
+    # Questa e' la SOLA regola che decide il punto, e sta in cima proprio
+    # perche' la garanzia non dipenda dall'ordine di cio' che segue. Il
+    # blocco degli statici, piu' in basso, dice "un asset non deve mai
+    # essere escluso dalla cache per colpa di un cookie": spostarlo sopra
+    # al controllo dei cookie sarebbe una modifica ragionevole a leggerne
+    # il commento, e rimetterebbe in cache le richieste di chi e'
+    # loggato. Con il controllo qui, quelle richieste non arrivano nemmeno
+    # a leggerlo.
+    if (req.http.Cookie ~ "(wordpress_logged_in_|wordpress_sec_|wp-resetpass-)"
+        || req.url ~ "^/(wp-admin|wp-login\.php|wp-signup\.php|wp-activate\.php|wp-cron\.php|wp-mail\.php|xmlrpc\.php|wp-trackback\.php)"
+        || req.http.Authorization
+        || req.http.X-WP-Nonce) {
+        set req.http.X-Stack-Bypass = "admin";
         return (pass);
     }
 
@@ -187,20 +232,16 @@ sub vcl_recv {
     # ---------------------------------------------------
     # Percorsi che non vanno mai in cache
     # ---------------------------------------------------
-    if (req.url ~ "^/(wp-admin|wp-login\.php|wp-cron\.php|xmlrpc\.php|wp-trackback\.php|wp-signup\.php|wp-activate\.php|wp-mail\.php)") {
-        return (pass);
-    }
+    # I percorsi di amministrazione e le richieste autenticate (cookie di
+    # sessione, header Authorization, nonce REST) sono gia' usciti dal
+    # gate qui sopra: elencarli anche qui vorrebbe dire tenere due liste
+    # allineate a mano, e una delle due prima o poi resta indietro.
+    #
+    # Quello che resta sono richieste anonime che pero' non producono una
+    # risposta riutilizzabile.
 
     # Anteprime, personalizzatore, editor a blocchi e AJAX: sempre freschi.
     if (req.url ~ "(\?|&)(preview|customize_changeset_uuid|customize_theme|unapproved|replytocom|nocache|wc-ajax|removed_item|add-to-cart)=") {
-        return (pass);
-    }
-
-    # REST API: le rotte pubbliche di lettura si possono cachare, ma solo
-    # in GET e solo per chi non e' autenticato (il controllo cookie e'
-    # subito sotto). Tutto cio' che porta un nonce o un header di
-    # autorizzazione passa.
-    if (req.http.Authorization || req.http.X-WP-Nonce) {
         return (pass);
     }
 
@@ -229,9 +270,11 @@ sub vcl_recv {
         if (req.http.Cookie == "") {
             # Non e' rimasto niente di significativo: visitatore anonimo.
             unset req.http.Cookie;
-        } else if (req.http.Cookie ~ "(wordpress_logged_in_|wordpress_sec_|wp-postpass_|comment_author_|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session_|edd_items_in_cart|wp-resetpass-)") {
-            # Utente loggato, commentatore, carrello pieno, pagina
-            # protetta da password: contenuto personale, niente cache.
+        } else if (req.http.Cookie ~ "(wp-postpass_|comment_author_|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session_|edd_items_in_cart)") {
+            # Commentatore, carrello pieno, pagina protetta da password:
+            # contenuto personale, niente cache. I cookie di sessione di
+            # WordPress non compaiono qui perche' non arrivano fin qui:
+            # li intercetta il gate in cima a vcl_recv.
             return (pass);
         } else {
             # Cookie residui sconosciuti (un plugin, un A/B test): il
@@ -251,7 +294,13 @@ sub vcl_recv {
     }
 
     # Un asset statico non deve mai essere escluso dalla cache per colpa
-    # di un cookie del visitatore.
+    # di un cookie di analytics o di consenso del visitatore.
+    #
+    # Attenzione: questo NON vale per chi ha una sessione WordPress
+    # aperta. Quelle richieste - anche quelle per un .css - sono gia'
+    # uscite dal gate in cima a vcl_recv e non passano di qui: per un
+    # amministratore gli asset li serve nginx, non Varnish. E' una scelta,
+    # non una dimenticanza: la RAM la si tiene per il pubblico.
     if (req.url ~ "\.(css|js|mjs|json|xml|txt|ico|gif|jpe?g|png|webp|avif|svg|svgz|woff2?|ttf|otf|eot|map)(\?.*)?$") {
         unset req.http.Cookie;
         return (hash);
@@ -286,7 +335,38 @@ sub vcl_hit {
     return (deliver);
 }
 
+sub vcl_backend_fetch {
+    # Il marcatore serve solo dentro Varnish, per etichettare la risposta
+    # in vcl_deliver. Al backend non serve, e un header in piu' inoltrato
+    # a ogni richiesta e' solo superficie.
+    unset bereq.http.X-Stack-Bypass;
+
+    # Niente "return (fetch)" qui: una sub che ritorna impedisce
+    # l'esecuzione di quella predefinita, che su una GET si occupa di
+    # scartare l'eventuale corpo della richiesta. Senza return, Varnish
+    # esegue la predefinita subito dopo questa.
+}
+
 sub vcl_backend_response {
+
+    # -----------------------------------------------
+    # Risposte che non verranno memorizzate
+    # -----------------------------------------------
+    # bereq.uncacheable e' vero per ogni fetch nato da un pass: le
+    # richieste amministrative, ma anche carrello, anteprime e media
+    # pesanti. Per tutte queste Varnish e' solo un tubo, quindi non ha
+    # senso costruire le etichette del BAN, calcolare TTL o decidere una
+    # politica di cache del browser al posto del backend: l'oggetto non
+    # esistera' mai.
+    #
+    # C'e' anche una ragione di correttezza: piu' in basso l'HTML esce
+    # con "Cache-Control: public". Su una pagina di wp-admin
+    # sovrascriverebbe il "no-store" che il mu-plugin ha messo apposta.
+    if (bereq.uncacheable) {
+        set beresp.uncacheable = true;
+        set beresp.ttl = 0s;
+        return (deliver);
+    }
 
     # Servono a vcl_recv per il BAN mirato: l'oggetto in cache si porta
     # dietro host e url con cui e' stato costruito.
@@ -393,7 +473,11 @@ sub vcl_deliver {
     unset resp.http.X-Pingback;
     unset resp.http.Link-Template;
 
-    if (obj.hits > 0) {
+    if (req.http.X-Stack-Bypass) {
+        # Varnish non ha guardato nemmeno in cache: la richiesta era
+        # amministrativa. Da qui in giu' rispondono nginx e PHP.
+        set resp.http.X-Cache = "BYPASS";
+    } elsif (obj.hits > 0) {
         set resp.http.X-Cache = "HIT";
         set resp.http.X-Cache-Hits = obj.hits;
     } else {
