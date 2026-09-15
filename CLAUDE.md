@@ -114,6 +114,28 @@ richieste finché la probe non se ne accorge.
 Non tornare a un `backend default` statico con il nome DNS: rompe appena
 compare un secondo indirizzo.
 
+**E non basta risolvere una volta all'avvio.** Gli indirizzi cambiano ogni
+volta che il container WordPress viene ricreato: un redeploy, un riavvio
+del solo servizio. Varnish resterebbe a puntare a indirizzi che non
+esistono più e risponderebbe 503 a tutti finché qualcuno non lo riavvia a
+mano — ed è successo davvero.
+
+Per questo `varnish-entrypoint.sh` **non** lancia `varnishd` con `exec`:
+resta vivo, ricontrolla gli indirizzi ogni `BACKEND_RECHECK_INTERVAL`
+secondi e, quando cambiano, rigenera il VCL e lo ricarica con
+`vcl.load` + `vcl.use`. A caldo: niente riavvio, cache conservata.
+
+Conseguenze da tenere presenti se si tocca lo script:
+
+- lo script è PID 1, quindi deve inoltrare `SIGTERM` a `varnishd`,
+  altrimenti `docker stop` finisce per uccidere il container;
+- il sonno del ciclo è spezzato in tranche da 5s proprio perché un
+  `sleep` lungo ritarderebbe la risposta al segnale oltre i 10s che
+  Docker concede;
+- una risoluzione vuota non deve far ricaricare niente: significa quasi
+  sempre che il backend si sta riavviando, e un VCL senza backend non
+  compila nemmeno.
+
 ### Ordine delle location in nginx
 
 Le regex vengono valutate nell'ordine in cui compaiono, e un prefisso
@@ -231,6 +253,12 @@ Nella stessa occasione è emerso che `varnishd -C` scrive su stderr.
 "The site you have requested is not installed" ogni minuto in attesa
 dell'installazione, WP-CLI si lamentava di `/root/.wp-cli`, e Varnish
 segnalava `mlock() of VSM failed` per via del limite `memlock` a 8 MB.
+
+**503 su tutto il sito, con Varnish vivo.** Gli header lo dicevano:
+`via: ... (Varnish/7.7)` e il corpo della pagina di `vcl_backend_error`,
+quindi non era Traefik ma Varnish senza backend raggiungibili. Terza
+ricaduta della stessa causa di fondo — indirizzi risolti una volta sola —
+da cui la sorveglianza con ricarica a caldo descritta sopra.
 
 **Varnish non partiva, secondo giro:** `Backend host "wordpress":
 resolves to too many addresses` — tre indirizzi sulla rete interna. Da qui
