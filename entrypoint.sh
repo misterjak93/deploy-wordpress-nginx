@@ -188,6 +188,45 @@ envsubst "${PHP_VARS}" < /opt/php-templates/pool.conf.template \
 # =======================================================
 # 3. Configurazione nginx
 # =======================================================
+# --- Perimetro dei proxy fidati ---
+# set_real_ip_from dice a nginx di quali hop fidarsi quando risale
+# X-Forwarded-For. Gli hop reali sono due e sono noti - Varnish sulla rete
+# del progetto, Traefik su dokploy-network - ma il secondo non e'
+# deducibile da qui: questo container non sta su quella rete, di proposito.
+# Il default resta quindi lo spazio privato; TRUSTED_PROXIES permette di
+# stringerlo a chi conosce le sottoreti della propria macchina.
+#
+# Il valore finisce dentro alla configurazione di nginx, quindi si accetta
+# solo cio' che e' davvero un indirizzo o una rete: un token con uno spazio
+# o un punto e virgola sarebbe una direttiva in piu'. In caso di dubbio si
+# torna al default, che e' largo ma non sbagliato.
+: "${TRUSTED_PROXIES:=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8}"
+
+TRUSTED_PROXY_LINES=""
+for _cidr in $(echo "${TRUSTED_PROXIES}" | tr ',' ' '); do
+    case "${_cidr}" in
+        *[!0-9./:abcdefABCDEF]*|"")
+            warn "TRUSTED_PROXIES contiene '${_cidr}', che non e' un indirizzo o una rete: ignorato."
+            continue
+            ;;
+    esac
+    TRUSTED_PROXY_LINES="${TRUSTED_PROXY_LINES}    set_real_ip_from    ${_cidr};
+"
+done
+
+if [ -z "${TRUSTED_PROXY_LINES}" ]; then
+    warn "TRUSTED_PROXIES non contiene nessun valore valido: uso lo spazio privato."
+    TRUSTED_PROXY_LINES='    set_real_ip_from    10.0.0.0/8;
+    set_real_ip_from    172.16.0.0/12;
+    set_real_ip_from    192.168.0.0/16;
+    set_real_ip_from    127.0.0.0/8;
+'
+fi
+# L'ultima riga porta gia' il suo a capo: la si toglie per non lasciare una
+# riga vuota in mezzo al blocco.
+TRUSTED_PROXY_LINES="${TRUSTED_PROXY_LINES%$'\n'}"
+export TRUSTED_PROXY_LINES
+
 if [ "${XMLRPC_ENABLED}" = "1" ]; then
     XMLRPC_DENY='# XMLRPC_ENABLED=1: endpoint attivo, protetto dal solo rate limit.'
 else
@@ -198,7 +237,7 @@ export XMLRPC_DENY
 NGINX_VARS='${DOMAIN} ${WP_ROOT} ${WP_BASE} ${PHP_UPLOAD_LIMIT} ${PHP_MAX_EXECUTION_TIME}
 ${NGINX_WORKER_CONNECTIONS} ${LIMIT_CONN_PER_IP} ${RATE_LIMIT_LOGIN} ${RATE_LIMIT_LOGIN_BURST}
 ${RATE_LIMIT_XMLRPC} ${RATE_LIMIT_XMLRPC_BURST} ${RATE_LIMIT_API} ${RATE_LIMIT_API_BURST}
-${XMLRPC_DENY} ${CONVERTED_DIR} ${FIREWALL_BYPASS_COOKIE}
+${XMLRPC_DENY} ${CONVERTED_DIR} ${FIREWALL_BYPASS_COOKIE} ${TRUSTED_PROXY_LINES}
 ${GZIP_LEVEL} ${BROTLI_LEVEL} ${ZSTD_LEVEL} ${COMPRESSION_MIN_LENGTH}
 ${FASTCGI_CACHE_DIR} ${FASTCGI_CACHE_ZONE_SIZE} ${FASTCGI_CACHE_MAX_SIZE}
 ${FASTCGI_CACHE_INACTIVE} ${FASTCGI_CACHE_TTL}'

@@ -146,6 +146,10 @@ services:
       - RATE_LIMIT_XMLRPC_BURST=${RATE_LIMIT_XMLRPC_BURST:-5}
       - RATE_LIMIT_API_BURST=${RATE_LIMIT_API_BURST:-40}
       - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-1}
+      # Hop fidati per X-Forwarded-For. Vedi il commento nel .env.example:
+      # il default e' largo perche' l'indirizzo di Traefik non e'
+      # deducibile da dentro questo container.
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8}
 
       # --- Immagini ---
       - CONVERTED_DIR=${CONVERTED_DIR:-compressx-nextgen}
