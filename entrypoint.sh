@@ -105,6 +105,15 @@ update-alternatives --set php "/usr/bin/php${PHP_VER}" >/dev/null 2>&1 || \
 : "${COMPRESSION_MIN_LENGTH:=256}"
 : "${COMPRESSION_PRIORITY:=br,zstd,gzip}"
 
+# --- Cache di pagina su disco (secondo livello, dopo Varnish) ---
+: "${FASTCGI_CACHE_ENABLED:=1}"
+: "${FASTCGI_CACHE_DIR:=/var/cache/nginx/wordpress}"
+: "${FASTCGI_CACHE_ZONE_SIZE:=64m}"
+: "${FASTCGI_CACHE_MAX_SIZE:=2g}"
+: "${FASTCGI_CACHE_INACTIVE:=60d}"
+: "${FASTCGI_CACHE_TTL:=30d}"
+: "${INSTALL_MU_PLUGINS:=1}"
+
 # --- Database e cache ---
 : "${DB_HOST:=mariadb}"
 : "${DB_NAME:=wordpress}"
@@ -128,6 +137,13 @@ ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime 2>/dev/null || true
 echo "${TZ}" > /etc/timezone 2>/dev/null || true
 
 log "PHP ${PHP_VER} | dominio ${DOMAIN} | worker PHP ${PHP_CONCURRENCY} | memoria ${PHP_MEM_LIMIT}"
+
+# Quale versione della configurazione sta girando davvero. Template e
+# snippet stanno dentro l'immagine: se questa impronta non cambia dopo un
+# deploy, l'immagine non e' stata ricostruita e le modifiche non ci sono.
+if [ -r /etc/stack-config-version ]; then
+    log "configurazione $(cat /etc/stack-config-version)"
+fi
 
 # =======================================================
 # 2. Configurazione PHP
@@ -177,14 +193,39 @@ NGINX_VARS='${DOMAIN} ${WP_ROOT} ${WP_BASE} ${PHP_UPLOAD_LIMIT} ${PHP_MAX_EXECUT
 ${NGINX_WORKER_CONNECTIONS} ${LIMIT_CONN_PER_IP} ${RATE_LIMIT_LOGIN} ${RATE_LIMIT_LOGIN_BURST}
 ${RATE_LIMIT_XMLRPC} ${RATE_LIMIT_XMLRPC_BURST} ${RATE_LIMIT_API} ${RATE_LIMIT_API_BURST}
 ${XMLRPC_DENY} ${CONVERTED_DIR} ${FIREWALL_BYPASS_COOKIE}
-${GZIP_LEVEL} ${BROTLI_LEVEL} ${ZSTD_LEVEL} ${COMPRESSION_MIN_LENGTH}'
+${GZIP_LEVEL} ${BROTLI_LEVEL} ${ZSTD_LEVEL} ${COMPRESSION_MIN_LENGTH}
+${FASTCGI_CACHE_DIR} ${FASTCGI_CACHE_ZONE_SIZE} ${FASTCGI_CACHE_MAX_SIZE}
+${FASTCGI_CACHE_INACTIVE} ${FASTCGI_CACHE_TTL}'
 
+export FASTCGI_CACHE_DIR FASTCGI_CACHE_ZONE_SIZE FASTCGI_CACHE_MAX_SIZE \
+       FASTCGI_CACHE_INACTIVE FASTCGI_CACHE_TTL
 export DOMAIN WP_ROOT NGINX_WORKER_CONNECTIONS LIMIT_CONN_PER_IP \
        RATE_LIMIT_LOGIN RATE_LIMIT_LOGIN_BURST RATE_LIMIT_XMLRPC RATE_LIMIT_XMLRPC_BURST \
        RATE_LIMIT_API RATE_LIMIT_API_BURST CONVERTED_DIR FIREWALL_BYPASS_COOKIE \
        GZIP_LEVEL BROTLI_LEVEL ZSTD_LEVEL COMPRESSION_MIN_LENGTH
 
 mkdir -p /etc/nginx/conf.d
+
+# --- Cache di pagina su disco ---
+# I due file vanno tenuti coerenti: la zona si dichiara nel contesto http,
+# l'uso dentro alle location. Se la cache e' spenta si scrive comunque la
+# coppia, ma vuota e con "fastcgi_cache off", altrimenti le location
+# includerebbero un file inesistente e nginx non partirebbe.
+if [ "${FASTCGI_CACHE_ENABLED}" = "1" ]; then
+    mkdir -p "${FASTCGI_CACHE_DIR}"
+    chown -R www-data:www-data "$(dirname "${FASTCGI_CACHE_DIR}")" 2>/dev/null || true
+    envsubst "${NGINX_VARS}" < /etc/nginx/templates/fastcgi-cache.conf.template \
+        > /etc/nginx/snippets/fastcgi-cache.conf
+    envsubst "${NGINX_VARS}" < /etc/nginx/templates/fastcgi-cache-use.conf.template \
+        > /etc/nginx/snippets/fastcgi-cache-use.conf
+    log "cache su disco attiva: ${FASTCGI_CACHE_DIR} | max ${FASTCGI_CACHE_MAX_SIZE} | ttl ${FASTCGI_CACHE_TTL}"
+else
+    : > /etc/nginx/snippets/fastcgi-cache.conf
+    printf '# Cache su disco disattivata (FASTCGI_CACHE_ENABLED=0).\nfastcgi_cache off;\n' \
+        > /etc/nginx/snippets/fastcgi-cache-use.conf
+    warn "cache su disco disattivata: ogni MISS di Varnish arrivera' a PHP."
+fi
+
 envsubst "${NGINX_VARS}" < /etc/nginx/templates/nginx.conf.template      > /etc/nginx/nginx.conf
 envsubst "${NGINX_VARS}" < /etc/nginx/templates/wordpress.conf.template  > /etc/nginx/conf.d/wordpress.conf
 
@@ -435,6 +476,29 @@ PHPEOF
 
     log "wp-config.php creato."
     log "Apri https://${DOMAIN} per completare l'installazione dal browser."
+fi
+
+# =======================================================
+# 6.1 Must-use plugin di gestione delle cache
+# =======================================================
+# Copiato ad OGNI avvio, non solo alla prima installazione: e' parte
+# dell'infrastruttura e deve seguire la versione dell'immagine, non
+# restare all'ultima versione installata per caso.
+#
+# Sta in mu-plugins e non in plugins perche' non deve poter essere
+# disattivato dalla bacheca: se sparisse, i due livelli di cache
+# smetterebbero di ricevere istruzioni sui TTL e sulle invalidazioni
+# senza che nessun errore lo segnali.
+if [ "${INSTALL_MU_PLUGINS}" = "1" ] && [ -d "${WP_ROOT}/wp-content" ]; then
+    MU_DIR="${WP_ROOT}/wp-content/mu-plugins"
+    mkdir -p "${MU_DIR}"
+    if cp -f /opt/wordpress/mu-plugins/*.php "${MU_DIR}/" 2>/dev/null; then
+        chown -R www-data:www-data "${MU_DIR}"
+        chmod 644 "${MU_DIR}"/*.php
+        log "must-use plugin aggiornati: $(ls -1 /opt/wordpress/mu-plugins/*.php 2>/dev/null | wc -l) file."
+    else
+        warn "impossibile copiare i must-use plugin in ${MU_DIR}."
+    fi
 fi
 
 # wp-config.php non deve mai essere leggibile da altri utenti del

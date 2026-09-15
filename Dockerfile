@@ -226,6 +226,7 @@ RUN set -eux; \
 # 6. Configurazione
 # -------------------------------------------------------
 COPY nginx/templates/     /etc/nginx/templates/
+COPY wordpress/mu-plugins/ /opt/wordpress/mu-plugins/
 COPY nginx/snippets/      /etc/nginx/snippets/
 COPY php/                 /opt/php-templates/
 COPY supervisord.conf     /etc/supervisor/supervisord.conf
@@ -234,8 +235,18 @@ COPY entrypoint.sh        /entrypoint.sh
 
 RUN set -eux; \
     chmod +x /entrypoint.sh /usr/local/bin/wp /usr/local/bin/*.sh; \
-    mkdir -p /var/www/wordpress/html /var/www/wordpress/logs /run/php /var/lib/nginx; \
-    chown -R www-data:www-data /var/www/wordpress /run/php
+    mkdir -p /var/www/wordpress/html /var/www/wordpress/logs /run/php /var/lib/nginx \
+             /var/cache/nginx/wordpress; \
+    chown -R www-data:www-data /var/www/wordpress /run/php /var/cache/nginx
+
+# Impronta della configurazione: i template e gli script nginx vivono
+# DENTRO l'immagine, quindi una loro modifica richiede un rebuild. Senza
+# un modo per vedere quale versione sta girando, capire se una correzione
+# e' arrivata davvero costa un giro di deploy alla cieca - e' gia'
+# successo. L'entrypoint stampa questa impronta all'avvio.
+RUN cat /etc/nginx/templates/* /etc/nginx/snippets/* /entrypoint.sh \
+        /opt/wordpress/mu-plugins/* 2>/dev/null \
+    | sha256sum | cut -c1-12 > /etc/stack-config-version
 
 EXPOSE 80
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \

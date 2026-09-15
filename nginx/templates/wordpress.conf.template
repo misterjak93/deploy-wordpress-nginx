@@ -175,6 +175,7 @@ server {
         try_files       $uri =404;
 
         include         /etc/nginx/snippets/security-headers.conf;
+        include         /etc/nginx/snippets/fastcgi-cache-use.conf;
         include         /etc/nginx/snippets/fastcgi-php.conf;
         fastcgi_pass    unix:/run/php/php-fpm.sock;
     }

@@ -1,0 +1,31 @@
+# =======================================================
+# Zona di cache FastCGI (contesto http)
+# =======================================================
+# Secondo livello di cache, su disco. Il primo e' Varnish, in RAM.
+#
+# Perche' due livelli invece di uno grande:
+#
+#   Varnish sta in RAM ed e' la piu' veloce, ma e' piccola e VOLATILE:
+#   un riavvio del container la azzera e il traffico piomba tutto su PHP
+#   nello stesso istante.
+#
+#   Questa sta su SSD, quindi puo' essere di gigabyte e con TTL di
+#   settimane, e SOPRAVVIVE ai riavvii di Varnish. E' lei che assorbe
+#   ogni MISS del primo livello: PHP viene toccato solo quando manca
+#   anche qui, cioe' quasi mai.
+#
+# use_temp_path=off fa scrivere nginx direttamente nella directory
+# finale: senza, ogni voce verrebbe scritta in una temporanea e poi
+# spostata, raddoppiando le scritture sull'SSD.
+fastcgi_cache_path ${FASTCGI_CACHE_DIR}
+                   levels=1:2
+                   keys_zone=wpcache:${FASTCGI_CACHE_ZONE_SIZE}
+                   max_size=${FASTCGI_CACHE_MAX_SIZE}
+                   inactive=${FASTCGI_CACHE_INACTIVE}
+                   use_temp_path=off;
+
+# La chiave non include lo schema: dietro Traefik nginx vede sempre http,
+# e includerlo darebbe solo l'illusione di distinguere. Il mu-plugin
+# ricalcola ESATTAMENTE questa stringa per cancellare una singola pagina,
+# quindi cambiarla qui significa cambiarla anche nel plugin.
+fastcgi_cache_key "$request_method|$host|$request_uri";

@@ -120,9 +120,15 @@ http {
     limit_conn_status 429;
 
     # -----------------------------------------------
+    # Cache di pagina su disco (secondo livello, dopo Varnish)
+    # -----------------------------------------------
+    include /etc/nginx/snippets/fastcgi-cache.conf;
+
+    # -----------------------------------------------
     # Mappe condivise
     # -----------------------------------------------
     include /etc/nginx/snippets/maps.conf;
+    include /etc/nginx/snippets/cache-maps.conf;
     include /etc/nginx/snippets/firewall-8g.conf;
 
     include /etc/nginx/conf.d/*.conf;
