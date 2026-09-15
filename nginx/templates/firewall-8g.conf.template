@@ -1,0 +1,182 @@
+# =======================================================
+# Firewall applicativo (contesto http)
+# =======================================================
+# Ispirato al firewall 8G di Jeff Starr, ma NON e' una traduzione riga per
+# riga: 8G nasce come .htaccess e alcune sue regole, portate cosi' come
+# sono su un sito WordPress moderno, bloccano traffico legittimo.
+#
+# Differenze deliberate rispetto all'originale:
+#   - SQL injection: pattern che richiedono sintassi SQL vera
+#     ("union ... select", "' or 1=1", "sleep(") invece del semplice
+#     "+select+", che colpisce la ricerca interna del sito
+#     (/?s=come+select+un+piano).
+#   - URL nella query string: bloccati solo gli schemi ftp/php/inurl.
+#     http e https restano ammessi, altrimenti salterebbe il
+#     redirect_to di wp-login.php.
+#   - curl e wget NON sono nella blocklist degli user agent: li usano
+#     healthcheck, webhook e integrazioni legittime.
+#   - archivi (.zip, .gz, .tar) non bloccati per estensione: molti siti
+#     distribuiscono file dalla cartella uploads.
+#
+# Ogni gruppo produce 0 (pulito) o 1 (sospetto); la combinazione finale
+# decide. Il cookie di bypass disattiva tutto: serve quando un page
+# builder o un plugin di import viene bloccato mentre ci lavori.
+
+# -------------------------------------------------------
+# QUERY STRING
+# -------------------------------------------------------
+map $query_string $fw_bad_query {
+    default 0;
+
+    # Traversal, null byte, CRLF injection, header injection
+    "~*(%00|%0d%0a|(\.\.(/|%2f)){2,})"                                  1;
+    "~*(^|&)(%2d|-)[^=]+$"                                              1;
+    "~*(set-cookie|content-type|location)(:|%3a)(.*)(%0d|%0a)"          1;
+
+    # File di sistema e file sensibili dell'applicazione
+    "~*(etc(/|%2f)(passwd|shadow|hosts|motd))"                          1;
+    "~*(boot|win)(\.|%2e)ini"                                           1;
+    "~*(self|proc)(/|%2f)environ"                                       1;
+    "~*((wp-)?config)((\.|%2e)inc)?(\.|%2e)php"                         1;
+
+    # RCE / code injection: nome funzione seguito da parentesi
+    "~*(base64_(en|de)code|eval|assert|exec|passthru|shell_exec|system|proc_open|popen|fsockopen|pfsockopen|file_put_contents|fwrite|create_function|call_user_func_array|invokefunction)(\s|%20)*(\(|%28)" 1;
+    "~*(phpinfo|php_uname|posix_getpwuid|getenv)(\s|%20)*(\(|%28)"      1;
+    "~*(allow_url_(fopen|include)|auto_prepend_file|disable_functions|open_basedir|safe_mode)" 1;
+
+    # XSS
+    "~*(<|%3c)(\s|%20)*/?(script|iframe|object|embed|svg|img|body|meta|link)" 1;
+    "~*(javascript|vbscript|data)(:|%3a)(.*)(alert|eval|document|cookie)" 1;
+    "~*(on(error|load|click|mouseover|focus))(\s|%20)*(=|%3d)"          1;
+
+    # SQL injection - pattern con sintassi SQL effettiva
+    "~*(union)(\s|%20|\+|/\*.*\*/)+(all(\s|%20|\+)+)?(select)"          1;
+    "~*(select)(\s|%20|\+).*(\s|%20|\+)(from|into(\s|%20|\+)+outfile)(\s|%20|\+)" 1;
+    "~*(insert(\s|%20|\+)+into|delete(\s|%20|\+)+from|drop(\s|%20|\+)+(table|database)|truncate(\s|%20|\+)+table)" 1;
+    "~*(sleep|benchmark|pg_sleep|waitfor(\s|%20|\+)+delay)(\s|%20)*(\(|%28)" 1;
+    "~*(load_file|group_concat|information_schema|@@version)"           1;
+    "~*(%27|%22|'|`)(\s|%20|\+)*(or|and)(\s|%20|\+)+[0-9a-z%]+(\s|%20)*(=|%3d|like)" 1;
+    "~*(order(\s|%20|\+)+by(\s|%20|\+)+[0-9]+(\s|%20|\+)*(--|%23|#))"   1;
+    "~*0x[0-9a-f]{16,}"                                                 1;
+
+    # Schemi remoti usati per LFI/RFI. http/https esclusi di proposito.
+    "~*(ftps?|php|inurl|expect|dict|gopher)(s)?(:|%3a)(/|%2f|%u2215){2}" 1;
+    "~*(absolute_|base|root_)(dir|path)(=|%3d)(ftp|https?)"             1;
+
+    # Variabili superglobali e overwrite
+    "~*(globals|mosconfig[a-z_]{1,22}|_request|_session)(=|\[|%5b)"     1;
+
+    # Query abnormemente lunga: nessun parametro legittimo lo e'
+    "~*[a-z0-9%]{3000,}"                                                1;
+}
+
+# -------------------------------------------------------
+# PERCORSO (decodificato, senza query string)
+# -------------------------------------------------------
+map $uri $fw_bad_path {
+    default 0;
+
+    "~*(%00|(\.\./){2,}|/{5,})"                                         1;
+    "~*[a-z0-9]{1500,}"                                                 1;
+
+    # Estensioni che non devono mai essere servite staticamente.
+    # Gli archivi (zip/gz/tar) NON sono qui: vedi nota in testa al file.
+    "~*\.(sql|bak|bkp|backup|old|orig|save|swp|swo|tmp|temp|log|ini|conf|cfg|config|dist|env|sh|bash|exe|dll|pem|key|crt|sqlite3?|db)$" 1;
+
+    # File di configurazione e di sviluppo lasciati in docroot
+    "~*/(wp-config|wp-config-sample|php\.ini|error_log|debug\.log|composer\.(json|lock)|package(-lock)?\.json|yarn\.lock|docker-compose\.ya?ml|Dockerfile|Makefile|readme\.html|license\.txt)$" 1;
+    "~*/(vendor|node_modules)/.*\.(md|yml|yaml|lock|json|dist)$"        1;
+
+    # Nomi tipici di webshell caricate dagli attaccanti
+    "~*/(c99|r57|alfa|wso|b374k|indoxploi|xleet|gel4y|sh3ll|shell|priv8|0byte|weevely|marijuana|mini|adminer|filemanager|fox|sidwso|bypass|upl|up|uploader|cmd|konektor)[a-z0-9_.-]*\.(php|phtml|phar|php[0-9]|pht|shtml)$" 1;
+    "~*/(eval-stdin|phpunit|dompdf|simplepie|autoload_classmap)\.php$"  1;
+    "~*/(phpunit|phpUnit)/"                                             1;
+
+    # Backup del sito lasciati in radice
+    "~*/(backup|archive|database|dump|db|site|www|wordpress|wp)[a-z0-9_-]*\.(sql|zip|tar|gz|tgz|rar|7z)$" 1;
+
+    # Pannelli e percorsi che questo stack non espone
+    "~*/(cgi-bin|_vti_bin|autodiscover|owa|ecp|solr|jenkins|actuator|telerik|struts|hnap1|boaform)/" 1;
+    "~*/(\.git|\.svn|\.hg|\.env|\.aws|\.ssh|\.idea|\.vscode|\.well-known/acme-challenge/\.)" 1;
+}
+
+# -------------------------------------------------------
+# USER AGENT
+# -------------------------------------------------------
+map $http_user_agent $fw_bad_ua {
+    default 0;
+
+    # Scanner e tool offensivi
+    "~*(sqlmap|nikto|nessus|openvas|acunetix|netsparker|arachni|w3af|havij|dirbuster|gobuster|feroxbuster|wfuzz|ffuf|masscan|zgrab|nmap|whatweb|wpscan|joomscan|xsser|commix|nuclei)" 1;
+
+    # Malware e worm noti
+    "~*(morfeus|zmeu|jorgee|muieblackcat|zollard|hakai|mirai|winnti|shellshock|thinkphp|chroot|casper|cmsworld|(c99|r57|php|web)shell)" 1;
+
+    # Payload dentro allo user agent
+    "~*(base64_decode|eval\(|<\?php|\$_(get|post|request|server)|/etc/passwd|union.*select)" 1;
+    "~*[a-z0-9]{1000,}"                                                 1;
+
+    # Crawler SEO/AI ad alto costo e senza ritorno per il sito.
+    # Togli dalla lista quello che ti serve: e' una scelta di policy,
+    # non di sicurezza.
+    "~*(ahrefsbot|semrushbot|mj12bot|dotbot|blexbot|megaindex|serpstat|seokicks|dataforseo|barkrowler|babbar|awario|sistrix|linkdexbot|spbot|seznambot|petalbot|bytespider|imagesiftbot|claudebot|gptbot|ccbot|omgili|diffbot|magpie-crawler|trendictionbot)" 1;
+
+    # Librerie usate quasi solo per scraping massivo.
+    # curl e wget restano ammessi di proposito.
+    "~*(libwww-perl|python-urllib|java/1\.|go-http-client|winhttp|httrack|webcopier|webzip|teleport|offline explorer|getright|flashget|grabnet|xaldon|siteSucker)" 1;
+}
+
+# -------------------------------------------------------
+# REFERER
+# -------------------------------------------------------
+map $http_referer $fw_bad_referer {
+    default 0;
+    "~*(%00|%0d%0a|<|>|%3c|%3e)"                                        1;
+    "~*(semalt\.com|buttons-for-website|darodar|blackhatworth|hulfingtonpost|ilovevitaly|econom\.co|savetubevideo|priceg\.com|100dollars-seo)" 1;
+    "~*(viagra|cialis|levitra|tramadol|xanax|phentermin|erectile|pro[sz]ac)" 1;
+}
+
+# -------------------------------------------------------
+# METODO HTTP
+# -------------------------------------------------------
+# Restano ammessi GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS: la REST API di
+# WordPress li usa tutti. PURGE e BAN si fermano a Varnish e non arrivano
+# mai fin qui.
+map $request_method $fw_bad_method {
+    default 0;
+    "~*^(TRACE|TRACK|DEBUG|CONNECT|MOVE|COPY|PROPFIND|PROPPATCH|MKCOL|LOCK|UNLOCK|SEARCH)$" 1;
+}
+
+# -------------------------------------------------------
+# COOKIE
+# -------------------------------------------------------
+map $http_cookie $fw_bad_cookie {
+    default 0;
+    "~*(%00|%0d%0a|<script|\.\./|(\(|%28)(\s|%20)*(select|union)(\s|%20))" 1;
+}
+
+# -------------------------------------------------------
+# BYPASS E COMBINAZIONE
+# -------------------------------------------------------
+# Cookie di bypass: stesso meccanismo dello stack OpenLiteSpeed.
+# Il valore va cambiato per ogni installazione (vedi README).
+map $http_cookie $fw_bypass {
+    default 0;
+    "~*${FIREWALL_BYPASS_COOKIE}"                                       1;
+}
+
+# L'healthcheck non deve poter essere bloccato da una regola futura.
+map $uri $fw_exempt {
+    default 0;
+    "/healthz"                                                          1;
+}
+
+map "$fw_bad_query$fw_bad_path$fw_bad_ua$fw_bad_referer$fw_bad_method$fw_bad_cookie" $fw_hit {
+    default     1;
+    "000000"    0;
+}
+
+map "$fw_hit$fw_bypass$fw_exempt" $fw_block {
+    default     0;
+    "100"       1;
+}

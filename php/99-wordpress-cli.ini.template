@@ -1,0 +1,19 @@
+; =======================================================
+; PHP CLI - override per WP-CLI
+; =======================================================
+; La CLI fa lavori che una richiesta web non fa mai: importare un dump,
+; rigenerare migliaia di miniature, migrare un database. Quei limiti
+; devono essere diversi.
+
+memory_limit = ${PHP_CLI_MEM_LIMIT}
+max_execution_time = 0
+max_input_time = -1
+
+; La CLI non serve risposte a nessuno: un errore a schermo e' esattamente
+; cio' che serve vedere nel terminale.
+display_errors = On
+error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
+
+; OPcache spento: un processo CLI vive pochi secondi, il tempo di
+; compilare la cache e' tempo perso.
+opcache.enable_cli = 0

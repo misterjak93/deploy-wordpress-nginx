@@ -1,0 +1,328 @@
+# =======================================================
+# WordPress: nginx + PHP-FPM + Varnish + Redis + MariaDB
+# =======================================================
+# Catena delle richieste:
+#
+#   Internet -> Traefik (TLS, Dokploy) -> Varnish (cache) -> nginx -> PHP-FPM
+#                                            |
+#                                            +-- Redis   (object cache)
+#                                            +-- MariaDB (dati)
+#
+# Il dominio pubblico va puntato su "varnish", NON su "wordpress": vedi
+# la sezione Domini del README. Il container wordpress resta sulla sola
+# rete interna, quindi non e' raggiungibile scavalcando la cache.
+
+services:
+
+  # -----------------------------------------------------
+  # Varnish - full page cache
+  # -----------------------------------------------------
+  varnish:
+    image: varnish:7.7
+    restart: unless-stopped
+    expose:
+      - "80"
+    # L'entrypoint dell'immagine ufficiale viene sostituito: prima genera
+    # il VCL dai segnaposto (l'immagine non ha envsubst, si usa sed) e poi
+    # fa exec di varnishd. Vedi varnish/varnish-entrypoint.sh.
+    entrypoint: ["/bin/sh", "/usr/local/bin/varnish-entrypoint.sh"]
+    command: []
+    environment:
+      - VARNISH_SIZE=${VARNISH_SIZE:-256m}
+      - VARNISH_TTL=${VARNISH_TTL:-6h}
+      - VARNISH_STATIC_TTL=${VARNISH_STATIC_TTL:-7d}
+      - VARNISH_GRACE=${VARNISH_GRACE:-24h}
+      - VARNISH_BACKEND_TIMEOUT=${PHP_MAX_EXECUTION_TIME:-300}
+      - VARNISH_THREAD_POOLS=${VARNISH_THREAD_POOLS:-2}
+      - VARNISH_THREAD_MIN=${VARNISH_THREAD_MIN:-100}
+      - VARNISH_THREAD_MAX=${VARNISH_THREAD_MAX:-1000}
+      - COMPRESSION_PRIORITY=${COMPRESSION_PRIORITY:-br,zstd,gzip}
+    volumes:
+      - ./varnish/default.vcl.template:/etc/varnish/default.vcl.template:ro
+      - ./varnish/varnish-entrypoint.sh:/usr/local/bin/varnish-entrypoint.sh:ro
+    # Varnish mappa il suo segmento di lavoro su file. Su tmpfs resta in
+    # RAM: senza, ogni scrittura passerebbe dal filesystem overlay del
+    # container, che e' la configurazione peggiore possibile per una cache.
+    tmpfs:
+      - /var/lib/varnish:exec,size=256m
+    healthcheck:
+      test: ["CMD-SHELL", "varnishadm ping || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    depends_on:
+      wordpress:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${VARNISH_MEM_LIMIT:-512M}
+    networks:
+      - wordpress-network
+      - dokploy-network
+
+  # -----------------------------------------------------
+  # WordPress - nginx + PHP-FPM nello stesso container
+  # -----------------------------------------------------
+  wordpress:
+    build:
+      context: .
+      args:
+        # Quali PHP finiscono nell'immagine. Cambiarlo richiede rebuild;
+        # scegliere quale delle tre gira e' invece PHP_VERSION, che e'
+        # solo runtime.
+        PHP_VERSIONS: ${PHP_VERSIONS:-8.3 8.4 8.5}
+    restart: unless-stopped
+    expose:
+      - "80"
+    environment:
+      - DOMAIN=${DOMAIN}
+      - ADMIN_EMAIL=${ADMIN_EMAIL}
+      - TZ=${TZ:-Europe/Rome}
+      - WORDPRESS_LOCALE=${WORDPRESS_LOCALE:-}
+
+      # --- PHP ---
+      - PHP_VERSION=${PHP_VERSION:-8.3}
+      - PHP_MEM_LIMIT=${PHP_MEM_LIMIT:-512M}
+      - PHP_CLI_MEM_LIMIT=${PHP_CLI_MEM_LIMIT:-1024M}
+      - PHP_CONCURRENCY=${PHP_CONCURRENCY:-20}
+      - PHP_UPLOAD_LIMIT=${PHP_UPLOAD_LIMIT:-128M}
+      - PHP_MAX_EXECUTION_TIME=${PHP_MAX_EXECUTION_TIME:-300}
+      - PHP_FPM_MAX_REQUESTS=${PHP_FPM_MAX_REQUESTS:-500}
+      - PHP_FPM_START_SERVERS=${PHP_FPM_START_SERVERS:-}
+      - PHP_FPM_MIN_SPARE=${PHP_FPM_MIN_SPARE:-}
+      - PHP_FPM_MAX_SPARE=${PHP_FPM_MAX_SPARE:-}
+      - PHP_SLOWLOG_TIMEOUT=${PHP_SLOWLOG_TIMEOUT:-10s}
+      - PHP_TERMINATE_TIMEOUT=${PHP_TERMINATE_TIMEOUT:-360s}
+      - PHP_DISABLE_FUNCTIONS=${PHP_DISABLE_FUNCTIONS:-}
+
+      # --- OPcache ---
+      - OPCACHE_MEMORY=${OPCACHE_MEMORY:-192}
+      - OPCACHE_STRINGS_BUFFER=${OPCACHE_STRINGS_BUFFER:-16}
+      - OPCACHE_MAX_FILES=${OPCACHE_MAX_FILES:-20000}
+      - OPCACHE_JIT=${OPCACHE_JIT:-disable}
+      - OPCACHE_JIT_BUFFER=${OPCACHE_JIT_BUFFER:-0}
+
+      # --- nginx e compressione ---
+      - NGINX_WORKER_CONNECTIONS=${NGINX_WORKER_CONNECTIONS:-4096}
+      - LIMIT_CONN_PER_IP=${LIMIT_CONN_PER_IP:-40}
+      - GZIP_LEVEL=${GZIP_LEVEL:-6}
+      - BROTLI_LEVEL=${BROTLI_LEVEL:-5}
+      - ZSTD_LEVEL=${ZSTD_LEVEL:-6}
+      - COMPRESSION_MIN_LENGTH=${COMPRESSION_MIN_LENGTH:-256}
+      # Letta anche qui, solo per avvisare nei log se chiede una codifica
+      # che nginx non sa produrre. A usarla davvero e' Varnish.
+      - COMPRESSION_PRIORITY=${COMPRESSION_PRIORITY:-br,zstd,gzip}
+
+      # --- Sicurezza ---
+      - FIREWALL_ENABLED=${FIREWALL_ENABLED:-1}
+      - FIREWALL_BYPASS_COOKIE=${FIREWALL_BYPASS_COOKIE:-wpfw-bypass-CAMBIAMI}
+      - XMLRPC_ENABLED=${XMLRPC_ENABLED:-0}
+      - RATE_LIMIT_LOGIN=${RATE_LIMIT_LOGIN:-20}
+      - RATE_LIMIT_XMLRPC=${RATE_LIMIT_XMLRPC:-10}
+      - RATE_LIMIT_API=${RATE_LIMIT_API:-20}
+      - RATE_LIMIT_LOGIN_BURST=${RATE_LIMIT_LOGIN_BURST:-10}
+      - RATE_LIMIT_XMLRPC_BURST=${RATE_LIMIT_XMLRPC_BURST:-5}
+      - RATE_LIMIT_API_BURST=${RATE_LIMIT_API_BURST:-40}
+      - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-1}
+
+      # --- Immagini ---
+      - CONVERTED_DIR=${CONVERTED_DIR:-compressx-nextgen}
+
+      # --- Database e cache ---
+      - DB_HOST=mariadb
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASS=${DB_PASS}
+      - DB_TABLE_PREFIX=${DB_TABLE_PREFIX:-wp_}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+
+      # --- Manutenzione ---
+      - WP_AUTO_INSTALL=${WP_AUTO_INSTALL:-1}
+      - WP_CRON_ENABLED=${WP_CRON_ENABLED:-true}
+      - WP_CRON_INTERVAL=${WP_CRON_INTERVAL:-60}
+      - FIX_PERMISSIONS=${FIX_PERMISSIONS:-0}
+    volumes:
+      - wordpress_data:/var/www/wordpress
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${WP_MEM_LIMIT:-1536M}
+    networks:
+      # Volutamente NON su dokploy-network: tutto il traffico pubblico
+      # deve passare da Varnish. Se serve un accesso diretto per
+      # diagnosi, aggiungi qui dokploy-network e un dominio dedicato,
+      # sapendo che quelle richieste saltano la cache.
+      - wordpress-network
+
+  # -----------------------------------------------------
+  # MariaDB
+  # -----------------------------------------------------
+  mariadb:
+    image: mariadb:11.8
+    restart: unless-stopped
+    command:
+      - "mariadbd"
+      - "--innodb-buffer-pool-size=${DB_BUFFER_POOL:-512M}"
+      - "--max-connections=${DB_CONNECTIONS:-200}"
+      - "--innodb-log-file-size=256M"
+      - "--innodb-flush-method=O_DIRECT"
+      # 2 = scrive il log ad ogni commit ma lo sincronizza su disco una
+      # volta al secondo. In cambio di un secondo di transazioni a
+      # rischio in caso di crash del kernel, si evita una fsync per ogni
+      # commit: su un WordPress con molte scritture la differenza e'
+      # nell'ordine delle volte, non dei punti percentuali.
+      - "--innodb-flush-log-at-trx-commit=2"
+      - "--innodb-io-capacity=1000"
+      - "--innodb-read-io-threads=4"
+      - "--innodb-write-io-threads=4"
+      - "--skip-name-resolve"
+    environment:
+      - MARIADB_ROOT_PASSWORD=${DB_ROOT_PASS}
+      - MARIADB_DATABASE=${DB_NAME}
+      - MARIADB_USER=${DB_USER}
+      - MARIADB_PASSWORD=${DB_PASS}
+      - MARIADB_AUTO_UPGRADE=1
+      - TZ=${TZ:-Europe/Rome}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - ./my.cnf:/etc/mysql/conf.d/zz-wordpress.cnf:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 6
+    deploy:
+      resources:
+        limits:
+          memory: ${DB_MEM_LIMIT:-1024M}
+    networks:
+      - wordpress-network
+
+  # -----------------------------------------------------
+  # Redis - object cache
+  # -----------------------------------------------------
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command:
+      - "redis-server"
+      - "--maxmemory"
+      - "${REDIS_MEM_LIMIT:-128mb}"
+      # allkeys-lru: quando la memoria finisce, Redis butta le chiavi usate
+      # meno di recente invece di rispondere errore. Per una cache e' il
+      # comportamento giusto; per un datastore non lo sarebbe.
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+      # Persistenza leggera: al riavvio la cache riparte gia' calda invece
+      # di scaricare tutto il peso su MariaDB nei primi minuti.
+      - "--save"
+      - "300 10"
+      - "--appendonly"
+      - "no"
+      - "--requirepass"
+      - "${REDIS_PASSWORD:-}"
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping; else redis-cli ping; fi | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: ${REDIS_CONTAINER_MEM:-256M}
+    networks:
+      - wordpress-network
+
+  # -----------------------------------------------------
+  # FileBrowser - gestione file via browser
+  # -----------------------------------------------------
+  # I volumi nascono di root: senza questo chown iniziale FileBrowser,
+  # che gira come www-data, non riuscirebbe a creare il suo database.
+  init-filebrowser:
+    image: alpine:3.21
+    command: sh -c "chown -R 33:33 /home/filebrowser/data"
+    volumes:
+      - filebrowser_data:/home/filebrowser/data
+    networks:
+      - wordpress-network
+
+  files:
+    image: gtstef/filebrowser:beta
+    restart: unless-stopped
+    # 33:33 = www-data, lo stesso utente di nginx e PHP-FPM. I file
+    # caricati dal pannello nascono gia' scrivibili da WordPress.
+    user: "33:33"
+    expose:
+      - "8080"
+    # L'immagine ha un HEALTHCHECK cablato su localhost:80. Con
+    # http.port:8080 in filebrowser.yaml fallirebbe sempre, il container
+    # resterebbe unhealthy e il provider Docker di Traefik scarta i
+    # container non sani: niente rotta, niente certificato, 404.
+    # Se cambi porta, cambiala in tre punti: qui, in expose e nello yaml.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    depends_on:
+      init-filebrowser:
+        condition: service_completed_successfully
+    volumes:
+      - wordpress_data:/srv
+      - filebrowser_data:/home/filebrowser/data
+      - ./filebrowser.yaml:/home/filebrowser/data/config.yaml:ro
+    environment:
+      # Niente sintassi ${VAR:?...}: fa fallire l'interpolazione con
+      # errore, e Dokploy rilegge e riscrive il compose per iniettare le
+      # label Traefik. Se quel passaggio va in errore il container parte
+      # comunque, ma senza label, e Traefik non crea ne' rotta ne'
+      # certificato.
+      - FILEBROWSER_ADMIN_PASSWORD=${FB_ADMIN_PASSWORD}
+    networks:
+      - wordpress-network
+      - dokploy-network
+
+  # -----------------------------------------------------
+  # Adminer - gestione database
+  # -----------------------------------------------------
+  adminer:
+    image: adminer:5
+    restart: unless-stopped
+    expose:
+      - "8080"
+    environment:
+      - ADMINER_DEFAULT_SERVER=mariadb
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    networks:
+      - wordpress-network
+      - dokploy-network
+
+volumes:
+  wordpress_data:
+  mariadb_data:
+  redis_data:
+  filebrowser_data:
+
+networks:
+  wordpress-network:
+  dokploy-network:
+    external: true

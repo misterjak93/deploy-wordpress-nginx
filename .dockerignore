@@ -1,0 +1,9 @@
+.git
+.gitignore
+.env
+.env.example
+README.md
+docker-compose.yml
+varnish/
+my.cnf
+filebrowser.yaml

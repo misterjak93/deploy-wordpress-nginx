@@ -1,0 +1,114 @@
+; =======================================================
+; PHP - impostazioni comuni (FPM e CLI)
+; =======================================================
+; Generato da entrypoint.sh in conf.d/99-wordpress.ini. Il prefisso 99
+; garantisce che venga letto per ultimo e vinca sui .ini dei pacchetti.
+
+; -------------------------------------------------------
+; Identita'
+; -------------------------------------------------------
+; Senza questo PHP annuncia la versione esatta nell'header X-Powered-By:
+; e' la prima cosa che cerca uno scanner per scegliere quale exploit
+; provare.
+expose_php = Off
+
+; -------------------------------------------------------
+; Limiti
+; -------------------------------------------------------
+memory_limit = ${PHP_MEM_LIMIT}
+max_execution_time = ${PHP_MAX_EXECUTION_TIME}
+max_input_time = ${PHP_MAX_EXECUTION_TIME}
+max_input_vars = 10000
+upload_max_filesize = ${PHP_UPLOAD_LIMIT}
+post_max_size = ${PHP_UPLOAD_LIMIT}
+default_socket_timeout = 60
+realpath_cache_size = 4096k
+realpath_cache_ttl = 600
+
+; -------------------------------------------------------
+; Errori
+; -------------------------------------------------------
+error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
+display_errors = Off
+display_startup_errors = Off
+log_errors = On
+log_errors_max_len = 2048
+ignore_repeated_errors = On
+
+; -------------------------------------------------------
+; Sicurezza
+; -------------------------------------------------------
+; PATH_INFO ricostruito da nginx: con fix_pathinfo a 1, una richiesta a
+; /foto.jpg/x.php farebbe eseguire foto.jpg come codice PHP. nginx ha gia'
+; il suo "try_files $uri =404" nella location PHP; questo e' il secondo
+; lucchetto, quello lato interprete.
+cgi.fix_pathinfo = 0
+
+; allow_url_fopen resta On: troppi plugin lo usano per leggere feed e
+; remote API, e spegnerlo rompe piu' di quanto protegga (le richieste
+; uscenti passano comunque da cURL nella stragrande maggioranza dei casi).
+; allow_url_include, che e' quello pericoloso, resta Off.
+allow_url_fopen = On
+allow_url_include = Off
+
+; Cookie di sessione: non leggibili da JavaScript, inviati solo in HTTPS,
+; non allegati alle richieste cross-site.
+session.cookie_httponly = 1
+session.cookie_secure = ${SESSION_COOKIE_SECURE}
+session.cookie_samesite = "Lax"
+session.use_strict_mode = 1
+session.use_only_cookies = 1
+session.sid_length = 48
+session.sid_bits_per_character = 6
+
+; -------------------------------------------------------
+; OPcache
+; -------------------------------------------------------
+; Tiene in RAM il bytecode compilato: senza, ogni richiesta ricompila
+; tutto WordPress da zero. E' il singolo intervento con il rapporto
+; beneficio/rischio piu' alto su PHP.
+opcache.enable = 1
+opcache.enable_cli = 0
+opcache.memory_consumption = ${OPCACHE_MEMORY}
+opcache.interned_strings_buffer = ${OPCACHE_STRINGS_BUFFER}
+opcache.max_accelerated_files = ${OPCACHE_MAX_FILES}
+opcache.max_wasted_percentage = 10
+opcache.use_cwd = 1
+
+; validate_timestamps = 1 fa ricontrollare i file ogni revalidate_freq
+; secondi. Metterlo a 0 e' piu' veloce, ma dopo ogni aggiornamento di
+; plugin o tema servirebbe un riavvio manuale di PHP-FPM: su un sito che
+; si aggiorna da solo e' il modo migliore per ritrovarsi con codice
+; vecchio in esecuzione e nessun indizio sul perche'.
+opcache.validate_timestamps = 1
+opcache.revalidate_freq = 2
+opcache.save_comments = 1
+opcache.fast_shutdown = 1
+opcache.huge_code_pages = 0
+
+; File cache su disco: sopravvive al riavvio dei worker e accorcia il
+; primo hit dopo un deploy.
+opcache.file_cache = /tmp/opcache
+opcache.file_cache_only = 0
+opcache.file_cache_consistency_checks = 1
+
+; JIT: su WordPress il guadagno e' vicino allo zero (il collo di
+; bottiglia sono I/O e query, non il calcolo) mentre la superficie di bug
+; non lo e'. Chi fa elaborazione numerica pesante puo' provare
+; opcache.jit=tracing con jit_buffer_size=64M.
+opcache.jit = ${OPCACHE_JIT}
+opcache.jit_buffer_size = ${OPCACHE_JIT_BUFFER}
+
+; -------------------------------------------------------
+; Redis / igbinary
+; -------------------------------------------------------
+; Serializzatore binario al posto di quello PHP: oggetti piu' compatti in
+; Redis e meno CPU per serializzarli. Attivo solo se l'estensione c'e'.
+${IGBINARY_SESSION}
+
+; -------------------------------------------------------
+; Varie
+; -------------------------------------------------------
+date.timezone = ${TZ}
+zend.assertions = -1
+zlib.output_compression = Off

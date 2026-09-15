@@ -1,0 +1,191 @@
+# =======================================================
+# Virtual host WordPress - generato da entrypoint.sh
+# =======================================================
+# Questo nginx non parla mai direttamente con Internet: davanti ci sono
+# Varnish (cache) e Traefik (TLS). Per questo non c'e' nessun listener
+# 443, nessun certificato e nessun redirect http->https: lo fa Traefik,
+# e farlo due volte creerebbe solo loop.
+
+server {
+    listen              80 default_server backlog=4096;
+    server_name         ${DOMAIN} www.${DOMAIN} localhost _;
+
+    root                ${WP_ROOT};
+    index               index.php index.html;
+
+    # Il limite vero e' quello di PHP; qui serve solo a far rifiutare a
+    # nginx gli upload sovradimensionati prima di svegliare PHP-FPM.
+    client_max_body_size ${PHP_UPLOAD_LIMIT};
+
+    # Tetto di connessioni contemporanee per IP: rende costoso il
+    # slowloris senza dare fastidio a un browser reale.
+    limit_conn          wp_conn ${LIMIT_CONN_PER_IP};
+
+    # -----------------------------------------------
+    # Firewall
+    # -----------------------------------------------
+    # 444 chiude la connessione senza risposta: a differenza di un 403
+    # non regala allo scanner la conferma che il target esiste e non
+    # consuma banda.
+    if ($fw_block) {
+        return 444;
+    }
+
+    # -----------------------------------------------
+    # Healthcheck
+    # -----------------------------------------------
+    # Solo dalla rete interna: e' quello che interroga il HEALTHCHECK del
+    # container e il depends_on di Varnish.
+    location = /healthz {
+        access_log      off;
+        allow           127.0.0.0/8;
+        allow           10.0.0.0/8;
+        allow           172.16.0.0/12;
+        allow           192.168.0.0/16;
+        deny            all;
+        add_header      Content-Type text/plain always;
+        return          200 "ok\n";
+    }
+
+    # Sonda dedicata a PHP-FPM: risponde solo se il pool e' vivo, cosa
+    # che /healthz (servito da nginx) non dice.
+    location = /healthz-php {
+        allow           127.0.0.0/8;
+        allow           10.0.0.0/8;
+        allow           172.16.0.0/12;
+        allow           192.168.0.0/16;
+        deny            all;
+        access_log      off;
+        include         /etc/nginx/snippets/fastcgi-php.conf;
+        fastcgi_param   SCRIPT_FILENAME /healthz-php;
+        fastcgi_pass    unix:/run/php/php-fpm.sock;
+    }
+
+    # Stato del pool: quanti worker sono attivi, quanti in coda, quante
+    # richieste lente. E' il dato che dice se PHP_CONCURRENCY e' tarato
+    # bene. "?full" elenca ogni singolo worker con la richiesta in corso.
+    location = /php-fpm-status {
+        allow           127.0.0.0/8;
+        allow           10.0.0.0/8;
+        allow           172.16.0.0/12;
+        allow           192.168.0.0/16;
+        deny            all;
+        access_log      off;
+        include         /etc/nginx/snippets/fastcgi-php.conf;
+        fastcgi_pass    unix:/run/php/php-fpm.sock;
+    }
+
+    # -----------------------------------------------
+    # Hardening dei percorsi
+    # -----------------------------------------------
+    include /etc/nginx/snippets/wordpress-hardening.conf;
+
+    # -----------------------------------------------
+    # Rate limit sulle superfici di autenticazione
+    # -----------------------------------------------
+    location = /wp-login.php {
+        limit_req       zone=wp_login burst=${RATE_LIMIT_LOGIN_BURST} nodelay;
+        include         /etc/nginx/snippets/security-headers.conf;
+        include         /etc/nginx/snippets/fastcgi-php.conf;
+        fastcgi_pass    unix:/run/php/php-fpm.sock;
+    }
+
+    location = /xmlrpc.php {
+        # XMLRPC_ENABLED=0 (default) lo chiude del tutto: e' la superficie
+        # preferita per il brute force amplificato (system.multicall prova
+        # centinaia di password in una richiesta sola).
+        # Mettilo a 1 solo se usi Jetpack o l'app mobile.
+        ${XMLRPC_DENY}
+        limit_req       zone=wp_xmlrpc burst=${RATE_LIMIT_XMLRPC_BURST} nodelay;
+        include         /etc/nginx/snippets/security-headers.conf;
+        include         /etc/nginx/snippets/fastcgi-php.conf;
+        fastcgi_pass    unix:/run/php/php-fpm.sock;
+    }
+
+    # admin-ajax e' l'unico endpoint "caldo" di wp-admin: lo usano anche i
+    # visitatori non loggati (carrello, filtri, form). Niente rate limit
+    # aggressivo, ma resta fuori dalla cache.
+    location = /wp-admin/admin-ajax.php {
+        include         /etc/nginx/snippets/security-headers.conf;
+        include         /etc/nginx/snippets/fastcgi-php.conf;
+        fastcgi_pass    unix:/run/php/php-fpm.sock;
+    }
+
+    location /wp-json/ {
+        limit_req       zone=wp_api burst=${RATE_LIMIT_API_BURST} nodelay;
+        try_files       $uri $uri/ /index.php?$args;
+    }
+
+    # -----------------------------------------------
+    # Immagini: negoziazione AVIF/WebP + cache lunga
+    # -----------------------------------------------
+    # I plugin di conversione (CompressX, WebP Express, ...) scrivono le
+    # varianti accanto all'originale con il nome completo: foo.jpg.avif.
+    # try_files prova avif, poi webp, poi l'originale; se il browser non
+    # dichiara il formato la mappa restituisce suffisso vuoto e il primo
+    # tentativo coincide con l'originale.
+    #
+    # "Vary: Accept" e' obbligatorio: senza, Varnish (e qualunque CDN a
+    # monte) servirebbe l'AVIF anche a chi non lo sa leggere.
+    location ~* ^/wp-content/(?<img_path>.+)\.(?<img_ext>jpe?g|png)$ {
+        add_header      Vary Accept;
+        add_header      Cache-Control "public, max-age=31536000, immutable";
+        add_header      X-Content-Type-Options "nosniff" always;
+        access_log      off;
+        try_files       /wp-content/${CONVERTED_DIR}/$img_path.$img_ext$img_avif
+                        /wp-content/${CONVERTED_DIR}/$img_path.$img_ext$img_webp
+                        $uri
+                        =404;
+    }
+
+    # -----------------------------------------------
+    # Asset statici
+    # -----------------------------------------------
+    location ~* \.(?:css|js|mjs|json|map|ico|gif|webp|avif|svg|svgz|bmp|tiff?|woff|woff2|ttf|otf|eot|mp4|webm|ogv|mp3|ogg|wav|flac|pdf|txt|xml|zip|gz)$ {
+        access_log      off;
+        log_not_found   off;
+        # Niente "expires": emetterebbe un secondo Cache-Control accanto a
+        # questo, e i due valori non coinciderebbero (expires non sa dire
+        # immutable). Un solo header, esplicito.
+        add_header      Cache-Control "public, max-age=31536000, immutable";
+        add_header      X-Content-Type-Options "nosniff" always;
+        add_header      Access-Control-Allow-Origin "*";
+        tcp_nodelay     off;
+        try_files       $uri =404;
+    }
+
+    # -----------------------------------------------
+    # PHP
+    # -----------------------------------------------
+    location ~ \.php$ {
+        # Senza questo, /immagine.jpg/inesistente.php verrebbe eseguito
+        # come PHP prendendo immagine.jpg come script (attacco classico
+        # con cgi.fix_pathinfo). In php.ini cgi.fix_pathinfo e' comunque
+        # a 0: due lucchetti sulla stessa porta.
+        try_files       $uri =404;
+
+        include         /etc/nginx/snippets/security-headers.conf;
+        include         /etc/nginx/snippets/fastcgi-php.conf;
+        fastcgi_pass    unix:/run/php/php-fpm.sock;
+    }
+
+    # -----------------------------------------------
+    # Permalink
+    # -----------------------------------------------
+    location / {
+        include         /etc/nginx/snippets/security-headers.conf;
+        try_files       $uri $uri/ /index.php?$args;
+    }
+
+    # Pagine di errore prodotte da nginx: niente banner, niente versione.
+    error_page 500 502 503 504 /50x.html;
+    location = /50x.html {
+        internal;
+        default_type    text/html;
+        # Anche una pagina di errore deve uscire con gli header di
+        # sicurezza: senza questo include, l'add_header della location
+        # azzererebbe quelli ereditati proprio sulle risposte 5xx.
+        include         /etc/nginx/snippets/security-headers.conf;
+        return 503 "<!doctype html><meta charset=\"utf-8\"><title>Servizio non disponibile</title><h1>Servizio non disponibile</h1><p>Il sito e' temporaneamente non raggiungibile. Riprova tra poco.</p>";
+    }
+}

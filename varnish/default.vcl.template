@@ -1,0 +1,377 @@
+vcl 4.1;
+
+import std;
+
+# =======================================================
+# Varnish Cache - full page cache per WordPress
+# =======================================================
+# Catena completa:  Internet -> Traefik (TLS) -> Varnish -> nginx -> PHP-FPM
+#
+# Varnish non termina TLS e non deve: lo fa Traefik, che gli passa la
+# richiesta in chiaro sulla rete interna insieme a X-Forwarded-Proto.
+#
+# I segnaposto delimitati da chiocciole vengono sostituiti all'avvio
+# da varnish-entrypoint.sh a partire dalle variabili del .env.
+# Il nome del segnaposto non va mai citato in un commento: lo script
+# rifiuta di partire se dopo la sostituzione ne trova ancora uno.
+
+backend default {
+    .host                   = "wordpress";
+    .port                   = "80";
+    .connect_timeout        = 5s;
+    .first_byte_timeout     = @BACKEND_TIMEOUT@s;
+    .between_bytes_timeout  = 60s;
+    .max_connections        = 500;
+
+    # Se nginx smette di rispondere, Varnish se ne accorge da solo e puo'
+    # continuare a servire gli oggetti scaduti (vedi grace in vcl_hit):
+    # il sito resta in piedi in sola lettura invece di dare 503.
+    .probe = {
+        .url       = "/healthz";
+        .timeout   = 2s;
+        .interval  = 5s;
+        .window    = 5;
+        .threshold = 3;
+    }
+}
+
+# Chi puo' invalidare la cache. Sono le reti private di Docker: dentro
+# questa compose ci arrivano solo i container dello stack.
+acl purger {
+    "localhost";
+    "127.0.0.0"/8;
+    "10.0.0.0"/8;
+    "172.16.0.0"/12;
+    "192.168.0.0"/16;
+}
+
+sub vcl_recv {
+
+    # ---------------------------------------------------
+    # Sonda di salute di Varnish stesso
+    # ---------------------------------------------------
+    if (req.url == "/varnish-health") {
+        return (synth(700, "varnish ok"));
+    }
+
+    # ---------------------------------------------------
+    # PURGE / BAN
+    # ---------------------------------------------------
+    # Doppia condizione, e la seconda e' quella che conta davvero.
+    #
+    # L'ACL da sola non basterebbe: le richieste che arrivano da Traefik
+    # hanno come client.ip proprio Traefik, che sta in 172.16/12. Chiunque
+    # da Internet potrebbe quindi mandare un PURGE e superare l'ACL.
+    #
+    # Il discriminante e' X-Forwarded-For. Varnish accoda sempre client.ip
+    # all'header in arrivo: una chiamata interna (wordpress -> varnish) ne
+    # produce uno con un solo indirizzo, una passata da Traefik ne ha
+    # almeno due, separati da virgola. Se c'e' una virgola, la richiesta
+    # viene dall'esterno e va rifiutata.
+    if (req.method == "PURGE" || req.method == "BAN") {
+        if (!client.ip ~ purger || req.http.X-Forwarded-For ~ ",") {
+            return (synth(403, "Purge non consentito da questa origine"));
+        }
+        if (req.method == "PURGE") {
+            return (purge);
+        }
+        # BAN accetta un'espressione regolare sull'URL: e' quello che usano
+        # i plugin per invalidare un intero gruppo di pagine in un colpo
+        # (per esempio tutto l'archivio di una categoria).
+        if (req.http.X-Ban-Expression) {
+            ban("obj.http.X-Cache-Host == " + req.http.host
+                + " && obj.http.X-Cache-Url ~ " + req.http.X-Ban-Expression);
+        } else {
+            ban("obj.http.X-Cache-Host == " + req.http.host);
+        }
+        return (synth(200, "Ban aggiunto"));
+    }
+
+    # Metodi che non sappiamo gestire: fuori subito, senza toccare il
+    # backend.
+    if (req.method != "GET" && req.method != "HEAD" &&
+        req.method != "PUT" && req.method != "POST" &&
+        req.method != "PATCH" && req.method != "TRACE" &&
+        req.method != "OPTIONS" && req.method != "DELETE") {
+        return (synth(405, "Metodo non consentito"));
+    }
+
+    # Solo GET e HEAD sono cacheabili. Tutto il resto va al backend.
+    if (req.method != "GET" && req.method != "HEAD") {
+        return (pass);
+    }
+
+    # ---------------------------------------------------
+    # Normalizzazione di Accept-Encoding
+    # ---------------------------------------------------
+    # nginx comprime in zstd, br o gzip e marca la risposta con
+    # "Vary: Accept-Encoding": senza questa normalizzazione Varnish
+    # terrebbe una copia per ogni variante testuale dell'header, e
+    # "gzip, deflate, br, zstd" e "br;q=1.0, gzip;q=0.8" sono due stringhe
+    # diverse per la stessa identica capacita'.
+    #
+    # Qui l'header viene ridotto a uno di quattro valori, quindi al
+    # massimo quattro copie per oggetto. L'ordine di preferenza arriva dal
+    # .env (COMPRESSION_PRIORITY).
+    if (req.http.Accept-Encoding) {
+        if (req.url ~ "\.(jpe?g|png|gif|webp|avif|ico|mp4|webm|ogv|mp3|ogg|zip|gz|tgz|bz2|rar|7z|woff2?)(\?.*)?$") {
+            # Gia' compressi: ricomprimerli non guadagna niente e
+            # moltiplicherebbe le varianti in cache.
+            unset req.http.Accept-Encoding;
+        }
+@ENCODING_BLOCK@
+        else {
+            unset req.http.Accept-Encoding;
+        }
+    }
+
+    # ---------------------------------------------------
+    # Normalizzazione di Accept per le immagini
+    # ---------------------------------------------------
+    # nginx negozia AVIF/WebP guardando Accept e risponde "Vary: Accept".
+    # Accept dei browser reali e' lunghissimo e tutto diverso: senza
+    # ridurlo a tre soli valori la cache delle immagini si frammenterebbe
+    # allo stesso modo di Accept-Encoding.
+    if (req.url ~ "\.(jpe?g|png)(\?.*)?$") {
+        if (req.http.Accept ~ "image/avif") {
+            set req.http.Accept = "image/avif";
+        } elsif (req.http.Accept ~ "image/webp") {
+            set req.http.Accept = "image/webp";
+        } else {
+            unset req.http.Accept;
+        }
+    }
+
+    # ---------------------------------------------------
+    # Normalizzazione dell'URL
+    # ---------------------------------------------------
+    # Parametri di tracciamento: non cambiano la pagina servita, ma
+    # cambiano l'URL, quindi ogni campagna creerebbe una copia in cache
+    # della stessa homepage.
+    if (req.url ~ "([?&])(utm_[a-z]+|gclid|gbraid|wbraid|fbclid|msclkid|ttclid|igshid|mc_[a-z]+|_ga|ref|yclid|dclid)=") {
+        set req.url = regsuball(req.url, "([?&])(utm_[a-z]+|gclid|gbraid|wbraid|fbclid|msclkid|ttclid|igshid|mc_[a-z]+|_ga|ref|yclid|dclid)=[^&]*", "\1");
+        set req.url = regsuball(req.url, "[?&]+$", "");
+        set req.url = regsub(req.url, "[?&]&+", "?");
+    }
+
+    # "/pagina?" e "/pagina" sono la stessa risorsa.
+    set req.url = regsub(req.url, "\?$", "");
+
+    # Host senza porta e in minuscolo: evita copie doppie per
+    # "Sito.com" e "sito.com:80".
+    set req.http.Host = regsub(std.tolower(req.http.Host), ":[0-9]+$", "");
+
+    # ---------------------------------------------------
+    # Percorsi che non vanno mai in cache
+    # ---------------------------------------------------
+    if (req.url ~ "^/(wp-admin|wp-login\.php|wp-cron\.php|xmlrpc\.php|wp-trackback\.php|wp-signup\.php|wp-activate\.php|wp-mail\.php)") {
+        return (pass);
+    }
+
+    # Anteprime, personalizzatore, editor a blocchi e AJAX: sempre freschi.
+    if (req.url ~ "(\?|&)(preview|customize_changeset_uuid|customize_theme|unapproved|replytocom|nocache|wc-ajax|removed_item|add-to-cart)=") {
+        return (pass);
+    }
+
+    # REST API: le rotte pubbliche di lettura si possono cachare, ma solo
+    # in GET e solo per chi non e' autenticato (il controllo cookie e'
+    # subito sotto). Tutto cio' che porta un nonce o un header di
+    # autorizzazione passa.
+    if (req.http.Authorization || req.http.X-WP-Nonce) {
+        return (pass);
+    }
+
+    # WooCommerce e simili: carrello, cassa e area utente sono per
+    # definizione personali.
+    if (req.url ~ "^/(cart|checkout|my-account|carrello|cassa|mio-account|account)(/|$)") {
+        return (pass);
+    }
+
+    # ---------------------------------------------------
+    # Cookie
+    # ---------------------------------------------------
+    if (req.http.Cookie) {
+        # Prima si buttano i cookie che non interessano al backend:
+        # analytics, pixel pubblicitari, consensi. Sono la ragione numero
+        # uno per cui una cache di pagina "non prende mai": basta un _ga
+        # per rendere ogni visitatore unico.
+        set req.http.Cookie = ";" + req.http.Cookie;
+        set req.http.Cookie = regsuball(req.http.Cookie, "; +", ";");
+        set req.http.Cookie = regsuball(req.http.Cookie,
+            ";(_ga[^;]*|_gid|_gat[^;]*|_gcl[^;]*|__utm[a-z]*|_fbp|_fbc|_hj[^;]*|_clck|_clsk|_pk_[^;]*|_uetsid|_uetvid|__cf_bm|cf_clearance|wordpress_test_cookie|PHPSESSID|euconsent[^;]*|cookielawinfo[^;]*|cmplz_[^;]*|borlabs[^;]*|CookieConsent|_pin_unauth|tk_[a-z]+)=[^;]*", "");
+        set req.http.Cookie = regsuball(req.http.Cookie, ";+ *", "; ");
+        set req.http.Cookie = regsub(req.http.Cookie, "^[; ]+", "");
+        set req.http.Cookie = regsub(req.http.Cookie, "[; ]+$", "");
+
+        if (req.http.Cookie == "") {
+            # Non e' rimasto niente di significativo: visitatore anonimo.
+            unset req.http.Cookie;
+        } else if (req.http.Cookie ~ "(wordpress_logged_in_|wordpress_sec_|wp-postpass_|comment_author_|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session_|edd_items_in_cart|wp-resetpass-)") {
+            # Utente loggato, commentatore, carrello pieno, pagina
+            # protetta da password: contenuto personale, niente cache.
+            return (pass);
+        } else {
+            # Cookie residui sconosciuti (un plugin, un A/B test): il
+            # backend li riceve comunque, ma non impediscono la cache.
+            unset req.http.Cookie;
+        }
+    }
+
+    # ---------------------------------------------------
+    # Statici
+    # ---------------------------------------------------
+    # I media pesanti restano fuori dalla cache: un solo video da 200 MB
+    # sfratterebbe migliaia di pagine HTML. nginx li serve con sendfile,
+    # che e' gia' la strada piu' corta.
+    if (req.url ~ "\.(mp4|webm|ogv|mov|avi|mkv|mp3|wav|flac|zip|tar|gz|tgz|rar|7z|iso|dmg|pdf)(\?.*)?$") {
+        return (pass);
+    }
+
+    # Un asset statico non deve mai essere escluso dalla cache per colpa
+    # di un cookie del visitatore.
+    if (req.url ~ "\.(css|js|mjs|json|xml|txt|ico|gif|jpe?g|png|webp|avif|svg|svgz|woff2?|ttf|otf|eot|map)(\?.*)?$") {
+        unset req.http.Cookie;
+        return (hash);
+    }
+
+    return (hash);
+}
+
+sub vcl_hash {
+    hash_data(req.url);
+
+    if (req.http.host) {
+        hash_data(req.http.host);
+    } else {
+        hash_data(server.ip);
+    }
+
+    # http e https non devono condividere la stessa entry: il sito
+    # genererebbe URL assoluti con lo schema sbagliato.
+    if (req.http.X-Forwarded-Proto) {
+        hash_data(req.http.X-Forwarded-Proto);
+    }
+
+    return (lookup);
+}
+
+sub vcl_hit {
+    # Grace: per @GRACE@ dopo la scadenza Varnish continua a servire la
+    # copia vecchia mentre ne richiede una nuova in background. Il
+    # visitatore non aspetta mai la rigenerazione di una pagina, e se il
+    # backend e' giu' il sito resta navigabile.
+    return (deliver);
+}
+
+sub vcl_backend_response {
+
+    # Servono a vcl_recv per il BAN mirato: l'oggetto in cache si porta
+    # dietro host e url con cui e' stato costruito.
+    set beresp.http.X-Cache-Host = bereq.http.host;
+    set beresp.http.X-Cache-Url  = bereq.url;
+
+    set beresp.grace = @GRACE@;
+    set beresp.keep  = 24h;
+
+    # Errori del backend: TTL cortissimo, cosi' un 500 momentaneo non
+    # resta appeso per ore, ma un picco di richieste sulla stessa pagina
+    # rotta non martella comunque PHP.
+    if (beresp.status >= 500) {
+        set beresp.ttl = 5s;
+        set beresp.uncacheable = true;
+        return (deliver);
+    }
+    if (beresp.status == 404) {
+        set beresp.ttl = 1m;
+    }
+
+    # Il backend ha chiesto esplicitamente di non cachare: si rispetta.
+    if (beresp.http.Cache-Control ~ "(private|no-cache|no-store)") {
+        set beresp.uncacheable = true;
+        set beresp.ttl = 0s;
+        return (deliver);
+    }
+
+    # Una risposta che imposta cookie e' quasi sempre personale (login,
+    # aggiunta al carrello, messaggio flash).
+    if (beresp.http.Set-Cookie) {
+        set beresp.uncacheable = true;
+        set beresp.ttl = 0s;
+        return (deliver);
+    }
+
+    # "Vary: User-Agent" da solo distrugge qualunque cache: le varianti di
+    # user agent sono praticamente infinite. Alcuni temi e plugin lo
+    # aggiungono senza motivo.
+    if (beresp.http.Vary ~ "User-Agent") {
+        set beresp.http.Vary = regsuball(beresp.http.Vary, ",? *User-Agent *", "");
+        set beresp.http.Vary = regsub(beresp.http.Vary, "^,? *", "");
+        if (beresp.http.Vary == "") {
+            unset beresp.http.Vary;
+        }
+    }
+
+    # TTL per tipo di contenuto.
+    if (bereq.url ~ "\.(css|js|mjs|ico|gif|jpe?g|png|webp|avif|svg|svgz|woff2?|ttf|otf|eot|map)(\?.*)?$") {
+        set beresp.ttl = @STATIC_TTL@;
+        # Gli asset di WordPress sono versionati via query string
+        # (?ver=6.x): un anno di cache browser e' sicuro.
+        set beresp.http.Cache-Control = "public, max-age=31536000, immutable";
+    } else {
+        set beresp.ttl = @DEFAULT_TTL@;
+
+        # Il browser non deve tenere l'HTML: la cache condivisa e'
+        # Varnish, ed e' l'unica che sappiamo invalidare. Se la tenesse
+        # anche il browser, un articolo corretto resterebbe vecchio per
+        # ore su quel dispositivo e nessun purge potrebbe raggiungerlo.
+        set beresp.http.Cache-Control = "public, max-age=0, s-maxage=0, must-revalidate";
+    }
+
+    # Nessun oggetto senza TTL: meglio un minuto di cache che zero.
+    if (beresp.ttl <= 0s) {
+        set beresp.ttl = 60s;
+    }
+
+    return (deliver);
+}
+
+sub vcl_deliver {
+    # Header di servizio: non devono uscire verso il visitatore.
+    unset resp.http.X-Cache-Host;
+    unset resp.http.X-Cache-Url;
+    unset resp.http.X-Powered-By;
+    unset resp.http.Server;
+    unset resp.http.X-Pingback;
+    unset resp.http.Link-Template;
+
+    if (obj.hits > 0) {
+        set resp.http.X-Cache = "HIT";
+        set resp.http.X-Cache-Hits = obj.hits;
+    } else {
+        set resp.http.X-Cache = "MISS";
+    }
+
+    return (deliver);
+}
+
+sub vcl_synth {
+    if (resp.status == 700) {
+        set resp.status = 200;
+        set resp.http.Content-Type = "text/plain; charset=utf-8";
+        set resp.body = "varnish ok";
+        return (deliver);
+    }
+
+    set resp.http.Content-Type = "text/html; charset=utf-8";
+    set resp.body = {"<!doctype html><meta charset="utf-8"><title>Errore</title>
+<h1>"} + resp.status + {"</h1><p>"} + resp.reason + {"</p>"};
+    return (deliver);
+}
+
+sub vcl_backend_error {
+    # nginx irraggiungibile e nessuna copia in grace da servire.
+    set beresp.http.Content-Type = "text/html; charset=utf-8";
+    set beresp.body = {"<!doctype html><meta charset="utf-8"><title>Servizio non disponibile</title>
+<h1>503</h1><p>Il sito e' temporaneamente non raggiungibile. Riprova tra poco.</p>"};
+    return (deliver);
+}

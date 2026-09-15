@@ -1,0 +1,97 @@
+; =======================================================
+; Pool PHP-FPM "wordpress" - generato da entrypoint.sh
+; =======================================================
+[wordpress]
+
+user = www-data
+group = www-data
+
+; Socket unix, non TCP: nginx e PHP-FPM stanno nello stesso container e un
+; socket di dominio unix evita del tutto lo stack di rete.
+listen = /run/php/php-fpm.sock
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+listen.backlog = 4096
+
+; -------------------------------------------------------
+; Gestione dei processi
+; -------------------------------------------------------
+; "dynamic": un gruppo di worker sempre pronti piu' altri creati a
+; richiesta. "ondemand" risparmierebbe RAM da fermo, ma fa pagare a ogni
+; picco il costo di avviare i processi proprio mentre il traffico sale.
+pm = dynamic
+pm.max_children = ${PHP_CONCURRENCY}
+pm.start_servers = ${PHP_FPM_START_SERVERS}
+pm.min_spare_servers = ${PHP_FPM_MIN_SPARE}
+pm.max_spare_servers = ${PHP_FPM_MAX_SPARE}
+pm.process_idle_timeout = 30s
+
+; Ricicla il worker dopo N richieste. E' la rete di sicurezza contro le
+; perdite di memoria dei plugin: senza, un worker cresce per giorni fino a
+; farsi uccidere dall'OOM killer nel mezzo di una richiesta.
+pm.max_requests = ${PHP_FPM_MAX_REQUESTS}
+
+; -------------------------------------------------------
+; Diagnostica
+; -------------------------------------------------------
+; Pagina di stato per capire se i worker bastano. Esposta solo dalla rete
+; interna (vedi la location in wordpress.conf).
+pm.status_path = /php-fpm-status
+ping.path = /healthz-php
+ping.response = pong
+
+; Traccia lo stack PHP delle richieste lente: dice quale funzione sta
+; bloccando, cosa che il log di nginx non puo' sapere.
+slowlog = ${WP_BASE}/logs/php-fpm-slow.log
+request_slowlog_timeout = ${PHP_SLOWLOG_TIMEOUT}
+
+; Tetto assoluto: oltre questo il worker viene terminato. Sta sopra
+; max_execution_time di PHP, che deve avere la precedenza e produrre un
+; errore PHP leggibile.
+request_terminate_timeout = ${PHP_TERMINATE_TIMEOUT}
+
+catch_workers_output = yes
+decorate_workers_output = no
+access.log = /dev/null
+
+; -------------------------------------------------------
+; Ambiente
+; -------------------------------------------------------
+; clear_env = no passa ai worker tutto l'ambiente del container, quindi
+; credenziali DB e host Redis sono gia' leggibili con getenv() senza
+; ripeterle qui una per una. Elencarle con la sintassi env[X] = $X
+; funzionerebbe, ma le scriverebbe in chiaro dentro a questo file.
+clear_env = no
+
+env[TMP] = /tmp
+env[TMPDIR] = /tmp
+env[TEMP] = /tmp
+env[PATH] = /usr/local/bin:/usr/bin:/bin
+
+; -------------------------------------------------------
+; Limiti per-pool
+; -------------------------------------------------------
+php_admin_value[memory_limit] = ${PHP_MEM_LIMIT}
+php_admin_value[upload_max_filesize] = ${PHP_UPLOAD_LIMIT}
+php_admin_value[post_max_size] = ${PHP_UPLOAD_LIMIT}
+php_admin_value[max_execution_time] = ${PHP_MAX_EXECUTION_TIME}
+php_admin_value[max_input_time] = ${PHP_MAX_EXECUTION_TIME}
+php_admin_value[max_input_vars] = 10000
+
+; Errori nel log del container, mai a schermo: un warning stampato in
+; mezzo all'HTML rivela percorsi e versioni, e rompe le risposte JSON
+; della REST API.
+php_admin_flag[display_errors] = off
+php_admin_flag[display_startup_errors] = off
+php_admin_flag[log_errors] = on
+php_admin_value[error_log] = /proc/self/fd/2
+
+; -------------------------------------------------------
+; Funzioni disabilitate (solo FPM)
+; -------------------------------------------------------
+; Vale per le richieste web, non per la CLI: WP-CLI continua ad avere
+; proc_open e compagnia, altrimenti meta' dei suoi comandi non
+; funzionerebbe. E' il motivo per cui la lista sta qui e non in un .ini
+; condiviso.
+php_admin_value[disable_functions] = ${PHP_DISABLE_FUNCTIONS}

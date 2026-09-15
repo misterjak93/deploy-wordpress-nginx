@@ -1,0 +1,129 @@
+# =======================================================
+# nginx.conf - generato da entrypoint.sh via envsubst
+# =======================================================
+# Le sole variabili sostituite sono quelle nella whitelist passata a
+# envsubst nell'entrypoint: tutte le $variabili di nginx ($uri, $host, ...)
+# restano intatte.
+
+user                    www-data;
+worker_processes        auto;
+worker_rlimit_nofile    65535;
+pid                     /run/nginx.pid;
+error_log               /dev/stderr warn;
+
+include /etc/nginx/modules-enabled/*.conf;
+
+events {
+    worker_connections  ${NGINX_WORKER_CONNECTIONS};
+    multi_accept        on;
+    use                 epoll;
+}
+
+http {
+    include             /etc/nginx/mime.types;
+    default_type        application/octet-stream;
+    charset             utf-8;
+
+    # Nota: image/avif, image/webp e font/woff2 sono gia' in mime.types da
+    # nginx 1.25. Ridichiararli qui farebbe solo stampare tre warning
+    # "duplicate extension" ad ogni avvio. Se un domani la negoziazione
+    # AVIF servisse application/octet-stream, e' li' che va guardato.
+
+    # -----------------------------------------------
+    # Identita' e limiti richiesta
+    # -----------------------------------------------
+    server_tokens       off;
+    client_max_body_size        ${PHP_UPLOAD_LIMIT};
+    client_body_buffer_size     512k;
+    client_body_timeout         30s;
+    client_header_timeout       30s;
+    send_timeout                60s;
+    large_client_header_buffers 4 32k;
+    types_hash_max_size         4096;
+    server_names_hash_bucket_size 128;
+    reset_timedout_connection   on;
+
+    # -----------------------------------------------
+    # IP reale del visitatore
+    # -----------------------------------------------
+    # La catena e' Traefik -> Varnish -> nginx: senza questo blocco ogni
+    # richiesta risulterebbe proveniente dall'IP di Varnish, e con essa
+    # i commenti WordPress, i rate limit e i log.
+    # real_ip_recursive scarta gli hop fidati partendo dal fondo di
+    # X-Forwarded-For e si ferma al primo indirizzo non fidato: il client.
+    set_real_ip_from    10.0.0.0/8;
+    set_real_ip_from    172.16.0.0/12;
+    set_real_ip_from    192.168.0.0/16;
+    set_real_ip_from    127.0.0.0/8;
+    real_ip_header      X-Forwarded-For;
+    real_ip_recursive   on;
+
+    # -----------------------------------------------
+    # Log
+    # -----------------------------------------------
+    # Su stdout/stderr: li raccoglie Dokploy. Nessun file da ruotare
+    # dentro al volume.
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" rt=$request_time '
+                    'uct=$upstream_connect_time urt=$upstream_response_time';
+
+    access_log          /dev/stdout main buffer=32k flush=5s;
+
+    # -----------------------------------------------
+    # I/O statico
+    # -----------------------------------------------
+    sendfile            on;
+    tcp_nopush          on;
+    tcp_nodelay         on;
+    keepalive_timeout   65s;
+    keepalive_requests  1000;
+    aio                 threads;
+    directio            16m;
+
+    open_file_cache             max=20000 inactive=60s;
+    open_file_cache_valid       60s;
+    open_file_cache_min_uses    2;
+    open_file_cache_errors      off;
+
+    # -----------------------------------------------
+    # Compressione
+    # -----------------------------------------------
+    # Zstandard, Brotli e gzip insieme. Il file e' generato
+    # dall'entrypoint perche' i livelli arrivano dal .env.
+    include /etc/nginx/snippets/compression.conf;
+
+    # -----------------------------------------------
+    # FastCGI
+    # -----------------------------------------------
+    fastcgi_buffers             16 16k;
+    fastcgi_buffer_size         32k;
+    fastcgi_busy_buffers_size   64k;
+    fastcgi_connect_timeout     60s;
+    fastcgi_send_timeout        ${PHP_MAX_EXECUTION_TIME}s;
+    fastcgi_read_timeout        ${PHP_MAX_EXECUTION_TIME}s;
+    fastcgi_keep_conn           on;
+    fastcgi_intercept_errors    off;
+
+    # -----------------------------------------------
+    # Rate limiting
+    # -----------------------------------------------
+    # Prima linea contro il brute force su wp-login.php e XML-RPC. I valori
+    # sono per-IP e arrivano dal .env; le zone restano dichiarate anche se
+    # il limite e' generoso, cosi' alzarlo o abbassarlo non tocca la
+    # struttura del file.
+    limit_req_zone  $binary_remote_addr zone=wp_login:10m  rate=${RATE_LIMIT_LOGIN}r/m;
+    limit_req_zone  $binary_remote_addr zone=wp_xmlrpc:10m rate=${RATE_LIMIT_XMLRPC}r/m;
+    limit_req_zone  $binary_remote_addr zone=wp_api:10m    rate=${RATE_LIMIT_API}r/s;
+    limit_conn_zone $binary_remote_addr zone=wp_conn:10m;
+    limit_req_status  429;
+    limit_conn_status 429;
+
+    # -----------------------------------------------
+    # Mappe condivise
+    # -----------------------------------------------
+    include /etc/nginx/snippets/maps.conf;
+    include /etc/nginx/snippets/firewall-8g.conf;
+
+    include /etc/nginx/conf.d/*.conf;
+}

@@ -1,0 +1,43 @@
+# =======================================================
+# FileBrowser Quantum v2 - configurazione
+# =======================================================
+# Doc: https://filebrowserquantum.com/en/docs/configuration/
+#
+# Sostituisce le variabili FB_* del vecchio filebrowser/filebrowser, che
+# in Quantum non esistono piu'. Montato read-only su
+# /home/filebrowser/data/config.yaml (percorso di default in Docker).
+
+server:
+  # SQLite, non piu' BoltDB. Sta nel volume filebrowser_data.
+  database:
+    path: "/home/filebrowser/data/filebrowser.sqlite"
+  cacheDir: "/home/filebrowser/data/tmp"
+
+  sources:
+    # Qui e' montato il volume wordpress_data: dentro ci sono html/ (la
+    # docroot) e logs/. Per vedere solo il sito, usa "/srv/html".
+    - path: "/srv"
+      name: "WordPress"
+      config:
+        defaultEnabled: true
+
+http:
+  # Il default di Quantum sarebbe 80. Teniamo 8080 per restare allineati
+  # all'expose del compose e al Domain configurato su Dokploy.
+  #
+  # ATTENZIONE: l'immagine ha un HEALTHCHECK cablato su localhost:80,
+  # quindi cambiando questa porta va sovrascritto anche l'healthcheck nel
+  # compose. Se non lo fai il container resta unhealthy e Traefik lo
+  # ignora: 404 sul dominio, con l'app che pero' risponde 200 in rete.
+  port: 8080
+  # Il servizio e' raggiungibile solo da Traefik. Senza questo, rate limit
+  # e log vedrebbero ogni richiesta come proveniente dal proxy.
+  trustProxyHeaders: true
+
+auth:
+  adminUsername: admin
+  # La password NON va messa qui: se presente nel config viene riscritta
+  # ad ogni avvio. Si passa con FILEBROWSER_ADMIN_PASSWORD (compose).
+  methods:
+    password:
+      enabled: true

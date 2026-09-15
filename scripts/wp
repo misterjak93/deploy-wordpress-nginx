@@ -1,0 +1,19 @@
+#!/bin/bash
+# =======================================================
+# Wrapper WP-CLI
+# =======================================================
+# Due cose che WP-CLI a mano non fa:
+#   - scende a www-data quando lo si lancia da root. WP-CLI da root si
+#     rifiuta di partire, e i file che creerebbe resterebbero non
+#     scrivibili da PHP.
+#   - si posiziona da solo sulla docroot, cosi' "wp plugin list" funziona
+#     da qualunque cartella.
+set -e
+: "${WP_ROOT:=/var/www/wordpress/html}"
+
+if [ "$(id -u)" -eq 0 ]; then
+    exec setpriv --reuid=www-data --regid=www-data --init-groups \
+        /usr/bin/php /usr/local/bin/wp-cli.phar --path="${WP_ROOT}" "$@"
+fi
+
+exec /usr/bin/php /usr/local/bin/wp-cli.phar --path="${WP_ROOT}" "$@"
