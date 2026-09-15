@@ -541,6 +541,43 @@ rinomina, o nginx logga un errore per ogni risposta cacheabile.
 Le directory messe da parte sono sorelle di quella di cache, non figlie:
 `nginx_status()` continua a contare solo le voci vive.
 
+### `/.well-known/` e gli endpoint OAuth/MCP non sono contenuto
+
+Sono la mappa con cui un client impara a parlare con questo sito, e
+finivano in cache come una pagina qualunque: GET anonima, nessun cookie,
+quindi il ramo generico di `vcl_backend_response` e `VARNISH_TTL` intero
+(sei ore di default).
+
+Il guasto vero, su un sito con un server MCP installato: in
+`/.well-known/oauth-protected-resource` WordPress pubblica
+l'identificatore della risorsa, che costruisce con `rest_url()`. Quel
+valore cambia **forma** con la struttura dei permalink —
+`/wp-json/mcp/...` con quelli leggibili, `/index.php?rest_route=/mcp/...`
+senza — quindi cambiare l'impostazione riscrive tutti gli URL del
+documento.
+
+Varnish continuava a servire la copia vecchia, mentre l'authorization
+endpoint sta sotto `/wp-admin`, che non è mai in cache e rispondeva con i
+valori nuovi. Il client leggeva un identificatore, il server ne calcolava
+un altro e rifiutava l'autorizzazione con *The requested resource is not
+served by this authorization server*. Con sei ore di TTL l'effetto è anche
+intermittente: la connessione riesce, poi cade e non si riesce più a
+rifarla.
+
+La regola sta in due posti che devono dire la stessa cosa — `vcl_recv` e
+`$cache_skip_uri` in `cache-maps.conf` — e copre **entrambe** le forme di
+URL della REST API: il client usa quella che ha letto nella discovery,
+non quella che preferiamo noi.
+
+Gli endpoint OAuth sono elencati insieme ai documenti di discovery anche
+se quasi sempre passano già oltre (sono POST, o portano `Authorization`):
+una GET anonima a `/wp-json/mcp/...` risponde 401, e un 401 tenuto per sei
+ore è di nuovo una cache che risponde qualcosa che non è un errore.
+
+Verificato contando le generazioni di pagina, non gli header: backend che
+emette un marcatore diverso ad ogni risposta, nginx e Varnish avviati uno
+davanti all'altro, e tre richieste per URL.
+
 ---
 
 ## Storico
