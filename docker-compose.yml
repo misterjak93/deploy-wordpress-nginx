@@ -40,6 +40,10 @@ services:
       # NON "wordpress": vedi l'alias sul servizio wordpress qui sotto.
       - BACKEND_HOST=${BACKEND_HOST:-wp-upstream}
       - BACKEND_RECHECK_INTERVAL=${BACKEND_RECHECK_INTERVAL:-15}
+      # Segreto condiviso con WordPress per PURGE e BAN. Deve essere lo
+      # stesso valore su entrambi i servizi: vuoto su uno solo e le
+      # invalidazioni verrebbero rifiutate.
+      - PURGE_TOKEN=${PURGE_TOKEN:-}
     volumes:
       - ./varnish/default.vcl.template:/etc/varnish/default.vcl.template:ro
       - ./varnish/varnish-entrypoint.sh:/usr/local/bin/varnish-entrypoint.sh:ro
@@ -174,6 +178,9 @@ services:
       - INSTALL_MU_PLUGINS=${INSTALL_MU_PLUGINS:-1}
       # Letto dal mu-plugin per invalidare Varnish dall'interno.
       - VARNISH_HOST=varnish
+      # Stesso valore del servizio varnish: il mu-plugin lo manda come
+      # header X-Purge-Token su ogni PURGE e BAN.
+      - PURGE_TOKEN=${PURGE_TOKEN:-}
 
       # --- Manutenzione ---
       - WP_AUTO_INSTALL=${WP_AUTO_INSTALL:-1}

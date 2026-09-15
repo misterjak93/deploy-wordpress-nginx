@@ -54,6 +54,8 @@ BACKEND_PORT="${BACKEND_PORT:-80}"
 # Ogni quanto ricontrollare gli indirizzi del backend. 0 disattiva la
 # sorveglianza e riporta al comportamento "risolvi una volta e basta".
 BACKEND_RECHECK_INTERVAL="${BACKEND_RECHECK_INTERVAL:-15}"
+# Segreto condiviso con WordPress per PURGE e BAN. Vuoto = solo ACL.
+PURGE_TOKEN="${PURGE_TOKEN:-}"
 
 ADMIN_ADDR=127.0.0.1:6082
 SECRET_FILE="${RUNTIME_DIR}/secret"
@@ -114,6 +116,37 @@ EOF
 fi
 
 # -------------------------------------------------------
+# Segreto per l'invalidazione
+# -------------------------------------------------------
+# Il valore finisce GREZZO dentro a una stringa VCL: un apice doppio
+# chiuderebbe la stringa e il VCL non compilerebbe, cioe' Varnish non
+# parte e il sito e' giu'. Si accetta quindi solo l'alfabeto sicuro, lo
+# stesso di FIREWALL_BYPASS_COOKIE.
+#
+# Un valore non valido non blocca l'avvio e non chiude l'invalidazione:
+# si torna al controllo con la sola ACL, dicendolo. Fallire chiusi qui
+# vorrebbe dire una cache che non si svuota piu', in silenzio - e questo
+# stack ha gia' pagato una volta quel genere di guasto.
+TOKEN_FILE="${RUNTIME_DIR}/token.vcl"
+: > "${TOKEN_FILE}"
+
+case "${PURGE_TOKEN}" in
+    "") ;;
+    *[!A-Za-z0-9_-]*)
+        warn "PURGE_TOKEN contiene caratteri non ammessi (solo lettere, numeri, '-' e '_'): ignorato."
+        warn "         PURGE e BAN restano protetti dalla sola ACL."
+        PURGE_TOKEN=""
+        ;;
+    *)
+        cat > "${TOKEN_FILE}" <<EOF
+        if (req.http.X-Purge-Token != "${PURGE_TOKEN}") {
+            return (synth(403, "Token di invalidazione mancante o errato"));
+        }
+EOF
+        ;;
+esac
+
+# -------------------------------------------------------
 # Risoluzione del backend
 # -------------------------------------------------------
 resolve_backend() {
@@ -129,12 +162,18 @@ render_vcl() {
     _ips="$2"
     _backends="${RUNTIME_DIR}/.backends.vcl"
     _members="${RUNTIME_DIR}/.members.vcl"
+    _acl="${RUNTIME_DIR}/.acl.vcl"
     : > "${_backends}"
     : > "${_members}"
+    : > "${_acl}"
 
     _n=0
     for _ip in ${_ips}; do
         _n=$(( _n + 1 ))
+        # Gli stessi indirizzi sono anche i soli autorizzati a invalidare:
+        # sono i container WordPress di questo progetto, non "chiunque
+        # stia su una rete privata".
+        echo "    \"${_ip}\";" >> "${_acl}"
         cat >> "${_backends}" <<EOF
 backend wp_${_n} {
     .host                   = "${_ip}";
@@ -158,7 +197,11 @@ EOF
     sed -i -e "/@ENCODING_BLOCK@/r ${ENC_FILE}"   -e "/@ENCODING_BLOCK@/d"   "${_out}"
     sed -i -e "/@BACKENDS@/r ${_backends}"        -e "/@BACKENDS@/d"         "${_out}"
     sed -i -e "/@DIRECTOR_MEMBERS@/r ${_members}" -e "/@DIRECTOR_MEMBERS@/d" "${_out}"
-    rm -f "${_backends}" "${_members}"
+    sed -i -e "/@PURGER_ACL@/r ${_acl}"           -e "/@PURGER_ACL@/d"       "${_out}"
+    # Il blocco del token puo' essere vuoto: "r" su un file vuoto non
+    # inserisce niente, e la riga del segnaposto sparisce comunque.
+    sed -i -e "/@PURGE_TOKEN_CHECK@/r ${TOKEN_FILE}" -e "/@PURGE_TOKEN_CHECK@/d" "${_out}"
+    rm -f "${_backends}" "${_members}" "${_acl}"
 
     if grep -q '@[A-Z_]\{3,\}@' "${_out}"; then
         warn "segnaposto non sostituiti nel VCL:"
@@ -223,6 +266,11 @@ fi
 
 log "cache ${VARNISH_SIZE} | ttl ${VARNISH_TTL} | statici ${VARNISH_STATIC_TTL} | grace ${VARNISH_GRACE}"
 log "priorita' compressione ${COMPRESSION_PRIORITY}"
+if [ -n "${PURGE_TOKEN}" ]; then
+    log "invalidazione: ACL sui backend + segreto condiviso."
+else
+    log "invalidazione: ACL sui soli backend di questo progetto (PURGE_TOKEN non impostato)."
+fi
 
 # -------------------------------------------------------
 # Avvio di varnishd

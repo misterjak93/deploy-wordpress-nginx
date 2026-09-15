@@ -61,14 +61,25 @@ sub vcl_init {
 @DIRECTOR_MEMBERS@
 }
 
-# Chi puo' invalidare la cache. Sono le reti private di Docker: dentro
-# questa compose ci arrivano solo i container dello stack.
+# Chi puo' invalidare la cache.
+#
+# L'elenco non e' scritto qui: lo genera varnish-entrypoint.sh, e contiene
+# esattamente gli indirizzi a cui risponde il nome del backend - cioe' i
+# container WordPress di QUESTO progetto - piu' localhost.
+#
+# Prima c'erano le reti private di Docker per intero. Sembrava equivalente
+# ("dentro ci sono solo i container dello stack") e non lo era:
+# dokploy-network e' condivisa da tutti i progetti della macchina, la
+# stessa ambiguita' che ha richiesto gli alias wp-upstream e wp-mariadb.
+# Un container di un altro stack soddisfaceva sia quella ACL sia il test
+# sul numero di indirizzi in X-Forwarded-For, e poteva quindi svuotare
+# questa cache.
+#
+# L'elenco si rigenera insieme ai backend ad ogni ricarica del VCL, quindi
+# segue da solo i container che vengono ricreati.
 acl purger {
     "localhost";
-    "127.0.0.0"/8;
-    "10.0.0.0"/8;
-    "172.16.0.0"/12;
-    "192.168.0.0"/16;
+@PURGER_ACL@
 }
 
 sub vcl_recv {
@@ -127,6 +138,12 @@ sub vcl_recv {
         if (!client.ip ~ purger || req.http.X-Forwarded-For ~ ",") {
             return (synth(403, "Purge non consentito da questa origine"));
         }
+        # Terza condizione, presente solo se nel .env c'e' un segreto
+        # condiviso: l'ACL dice da dove arriva la richiesta, il segreto
+        # dice chi l'ha scritta. Serve contro chi potesse falsificare
+        # l'indirizzo di origine; senza segreto restano le prime due.
+        # Il blocco lo scrive varnish-entrypoint.sh.
+@PURGE_TOKEN_CHECK@
         if (req.method == "PURGE") {
             return (purge);
         }

@@ -293,6 +293,38 @@ final class Stack_Cache {
 		return (string) ( getenv( 'VARNISH_HOST' ) ?: 'varnish' );
 	}
 
+	/**
+	 * Header comuni a PURGE e BAN.
+	 *
+	 * X-Forwarded-Proto e' obbligatorio, e non e' un dettaglio: vcl_hash
+	 * lo include quando c'e'. Le richieste dei visitatori passano da
+	 * Traefik e ce l'hanno sempre, quindi gli oggetti in cache sono
+	 * indicizzati su url+host+"https". Senza questo header il PURGE
+	 * calcolava un hash diverso, non trovava nulla, e Varnish rispondeva
+	 * 200 lo stesso: l'invalidazione della singola pagina non funzionava
+	 * mai, in silenzio. Il VCL ora mette anche un default, ma mandarlo da
+	 * qui rende la cosa leggibile da questo lato.
+	 *
+	 * X-Purge-Token c'e' solo se il .env lo definisce. Il VCL lo pretende
+	 * solo in quel caso, quindi i due lati non possono sfasarsi: lo stesso
+	 * valore arriva a entrambi i container.
+	 *
+	 * @return array<string,string>
+	 */
+	private function purge_headers(): array {
+		$headers = array(
+			'Host'              => $this->site_host(),
+			'X-Forwarded-Proto' => 'https',
+		);
+
+		$token = (string) ( getenv( 'PURGE_TOKEN' ) ?: '' );
+		if ( '' !== $token ) {
+			$headers['X-Purge-Token'] = $token;
+		}
+
+		return $headers;
+	}
+
 	private function site_host(): string {
 		$host = wp_parse_url( home_url(), PHP_URL_HOST );
 		return is_string( $host ) ? strtolower( $host ) : '';
@@ -316,20 +348,7 @@ final class Stack_Cache {
 			'http://' . $this->varnish_host() . $path,
 			array(
 				'method'    => 'PURGE',
-				'headers'   => array(
-					'Host' => $this->site_host(),
-					// Obbligatorio, e non e' un dettaglio: vcl_hash include
-					// X-Forwarded-Proto quando c'e'. Le richieste dei
-					// visitatori passano da Traefik e ce l'hanno sempre,
-					// quindi gli oggetti in cache sono indicizzati su
-					// url+host+"https". Senza questo header il PURGE
-					// calcolava un hash diverso, non trovava nulla, e
-					// Varnish rispondeva 200 lo stesso: l'invalidazione
-					// della singola pagina non funzionava mai, in silenzio.
-					// Il VCL ora mette anche un default, ma mandarlo da qui
-					// rende la cosa leggibile da questo lato.
-					'X-Forwarded-Proto' => 'https',
-				),
+				'headers'   => $this->purge_headers(),
 				'timeout'   => 5,
 				'sslverify' => false,
 			)
@@ -343,15 +362,12 @@ final class Stack_Cache {
 			'http://' . $this->varnish_host() . '/',
 			array(
 				'method'    => 'BAN',
-				'headers'   => array(
-					'Host'              => $this->site_host(),
-					'X-Ban-Expression'  => '.',
-					// Il BAN confronta gli header dell'oggetto, non l'hash,
-					// quindi qui non sarebbe indispensabile. Si manda per
-					// coerenza con il PURGE: l'unica forma che il VCL vede
-					// arrivare e' quella di una richiesta passata dal bordo.
-					'X-Forwarded-Proto' => 'https',
-				),
+				// Il BAN confronta gli header dell'oggetto, non l'hash,
+				// quindi X-Forwarded-Proto qui non sarebbe indispensabile.
+				// Si manda per coerenza con il PURGE: l'unica forma che il
+				// VCL vede arrivare e' quella di una richiesta passata dal
+				// bordo.
+				'headers'   => $this->purge_headers() + array( 'X-Ban-Expression' => '.' ),
 				'timeout'   => 5,
 				'sslverify' => false,
 			)
