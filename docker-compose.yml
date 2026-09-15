@@ -173,6 +173,9 @@ services:
 
       # --- Manutenzione ---
       - WP_AUTO_INSTALL=${WP_AUTO_INSTALL:-1}
+      # auto: /wp-admin/install.php aperto solo finche' il sito non e'
+      # installato, poi 404. deny lo chiude sempre, open lo lascia aperto.
+      - WP_INSTALL_ACCESS=${WP_INSTALL_ACCESS:-auto}
       - WP_CRON_ENABLED=${WP_CRON_ENABLED:-true}
       - WP_CRON_INTERVAL=${WP_CRON_INTERVAL:-60}
       - FIX_PERMISSIONS=${FIX_PERMISSIONS:-0}

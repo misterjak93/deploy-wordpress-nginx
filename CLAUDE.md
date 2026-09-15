@@ -172,6 +172,24 @@ Le regex vengono valutate nell'ordine in cui compaiono, e un prefisso
 - `/wp-json/` è un prefisso semplice, non `^~`: con `^~` la regex che
   protegge `/wp-json/wp/v2/users` non verrebbe mai raggiunta.
 
+### L'hardening non può chiudere `install.php` prima dell'installazione
+
+`wordpress-hardening.conf` chiudeva `/wp-admin/install.php` e
+`/wp-admin/setup-config.php` con un 404 fisso. Ma l'entrypoint, dopo aver
+generato `wp-config.php`, scrive "apri il sito per completare
+l'installazione dal browser": quella pagina è l'unica strada, e rispondeva
+**404**. Sito appena deployato e non installabile affatto.
+
+Le due location vivono ora in `install-guard.conf`, generato ad ogni avvio
+da `entrypoint.sh` in base allo stato vero (`wp core is-installed`, e
+l'esistenza di `wp-config.php` per `setup-config.php`), con
+`WP_INSTALL_ACCESS` per forzare `deny` o `open`. Chiuse per default su un
+sito installato, aperte solo finché servono.
+
+Se si tocca: il guard va scritto **sempre**, anche quando è "chiuso", o
+l'`include` in `wordpress-hardening.conf` punta a un file inesistente e
+nginx non parte. Stesso schema della coppia `fastcgi-cache*.conf`.
+
 ### Mai inviare `PATH_TRANSLATED` a php-fpm
 
 `99-wordpress.ini` imposta `cgi.fix_pathinfo = 0`, che è la scelta giusta

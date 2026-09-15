@@ -133,6 +133,12 @@ export WP_CRON_ENABLED WP_CRON_INTERVAL WP_ROOT WP_BASE
 : "${WP_AUTO_INSTALL:=1}"
 : "${FIX_PERMISSIONS:=0}"
 
+# Chi puo' raggiungere /wp-admin/install.php e /wp-admin/setup-config.php.
+#   auto  - aperti solo finche' servono davvero (default)
+#   deny  - sempre 404
+#   open  - sempre raggiungibili
+: "${WP_INSTALL_ACCESS:=auto}"
+
 ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime 2>/dev/null || true
 echo "${TZ}" > /etc/timezone 2>/dev/null || true
 
@@ -504,6 +510,107 @@ fi
 # wp-config.php non deve mai essere leggibile da altri utenti del
 # container: contiene le credenziali del database.
 [ -f "${WP_ROOT}/wp-config.php" ] && chmod 640 "${WP_ROOT}/wp-config.php"
+
+# =======================================================
+# 6.2 Accesso all'installer
+# =======================================================
+# Su un sito installato /wp-admin/install.php e /wp-admin/setup-config.php
+# vanno chiusi: sono la porta d'ingresso classica di chi trova un sito con
+# il database vuoto, e ci ripunta WordPress su un database proprio
+# diventando amministratore.
+#
+# Ma finche' il sito NON e' installato quella stessa porta e' l'unico modo
+# di installarlo dal browser, che e' proprio cio' che l'entrypoint dice di
+# fare dopo aver creato wp-config.php. Chiuderla sempre - com'era - dava
+# 404 su /wp-admin/install.php al primo accesso: sito non installabile
+# affatto, con l'unica via d'uscita "wp core install" dalla CLI.
+#
+# Il guard viene quindi generato ad ogni avvio in base allo stato reale:
+# aperto solo finche' serve, richiuso da solo al riavvio successivo.
+# Nessuna finestra aggiuntiva: dopo l'installazione install.php risponde
+# comunque "Gia' installato" senza toccare niente.
+case "${WP_INSTALL_ACCESS}" in
+    auto|deny|open) ;;
+    *)
+        warn "WP_INSTALL_ACCESS='${WP_INSTALL_ACCESS}' non e' un valore valido (auto, deny, open): uso 'auto'."
+        WP_INSTALL_ACCESS=auto
+        ;;
+esac
+
+# Un timeout esplicito perche' qui si interroga il database: senza, un
+# database irraggiungibile ritarderebbe l'avvio di nginx di un minuto
+# buono. Il fallimento vale "non installato", che e' anche il caso in cui
+# l'installer serve.
+if timeout 20 /usr/local/bin/wp core is-installed >/dev/null 2>&1; then
+    WP_IS_INSTALLED=1
+else
+    WP_IS_INSTALLED=0
+fi
+
+case "${WP_INSTALL_ACCESS}" in
+    open)
+        OPEN_INSTALL=1
+        OPEN_SETUP=1
+        ;;
+    deny)
+        OPEN_INSTALL=0
+        OPEN_SETUP=0
+        ;;
+    *)
+        # install.php serve finche' le tabelle non ci sono; setup-config.php
+        # solo se manca wp-config.php (con WP_AUTO_INSTALL=1 non succede mai:
+        # lo genera l'entrypoint qui sopra).
+        if [ "${WP_IS_INSTALLED}" = "1" ]; then OPEN_INSTALL=0; else OPEN_INSTALL=1; fi
+        if [ -f "${WP_ROOT}/wp-config.php" ]; then OPEN_SETUP=0; else OPEN_SETUP=1; fi
+        ;;
+esac
+
+# L'installer sta dietro allo stesso rate limit di wp-login.php: e' una
+# pagina che un utente legittimo carica una manciata di volte, e lasciarla
+# aperta a raffica sarebbe un invito.
+install_guard_open() {
+    cat <<EOF
+location = $1 {
+    limit_req       zone=wp_login burst=${RATE_LIMIT_LOGIN_BURST} nodelay;
+    include         /etc/nginx/snippets/security-headers.conf;
+    include         /etc/nginx/snippets/fastcgi-php.conf;
+    fastcgi_pass    unix:/run/php/php-fpm.sock;
+}
+EOF
+}
+
+install_guard_deny() {
+    printf 'location = %s { deny all; return 404; }\n' "$1"
+}
+
+if [ "${WP_IS_INSTALLED}" = "1" ]; then
+    INSTALL_STATE="installato"
+else
+    INSTALL_STATE="non installato (o database non raggiungibile)"
+fi
+
+{
+    printf '# Generato da entrypoint.sh: WP_INSTALL_ACCESS=%s, WordPress %s.\n' \
+        "${WP_INSTALL_ACCESS}" "${INSTALL_STATE}"
+    if [ "${OPEN_INSTALL}" = "1" ]; then
+        install_guard_open /wp-admin/install.php
+    else
+        install_guard_deny /wp-admin/install.php
+    fi
+    if [ "${OPEN_SETUP}" = "1" ]; then
+        install_guard_open /wp-admin/setup-config.php
+    else
+        install_guard_deny /wp-admin/setup-config.php
+    fi
+} > /etc/nginx/snippets/install-guard.conf
+
+if [ "${OPEN_INSTALL}" = "1" ] && [ "${WP_INSTALL_ACCESS}" = "open" ]; then
+    warn "WP_INSTALL_ACCESS=open: /wp-admin/install.php resta raggiungibile anche a sito installato."
+elif [ "${OPEN_INSTALL}" = "1" ]; then
+    log "Installer aperto: completa l'installazione su https://${DOMAIN}/wp-admin/install.php (si richiude da solo al riavvio successivo)."
+else
+    log "Installer chiuso: /wp-admin/install.php risponde 404."
+fi
 
 # =======================================================
 # 7. Verifica della configurazione
