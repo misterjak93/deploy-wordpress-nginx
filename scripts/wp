@@ -10,6 +10,16 @@
 #     da qualunque cartella.
 set -e
 : "${WP_ROOT:=/var/www/wordpress/html}"
+: "${WP_BASE:=/var/www/wordpress}"
+
+# WP-CLI scrive cache e configurazione in $HOME/.wp-cli. Girando come
+# www-data ma con HOME ereditato da root, ogni comando stampa
+# "Failed to create directory '/root/.wp-cli/cache/'" e la cache dei
+# download non funziona. HOME va quindi su una directory che www-data
+# possiede davvero. Sta accanto alla docroot, non dentro: non e'
+# raggiungibile dal web.
+export HOME="${WP_BASE}"
+export WP_CLI_CACHE_DIR="${WP_BASE}/.wp-cli/cache"
 
 if [ "$(id -u)" -eq 0 ]; then
     exec setpriv --reuid=www-data --regid=www-data --init-groups \
