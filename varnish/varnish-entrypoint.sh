@@ -73,6 +73,62 @@ EOF
 fi
 
 # -------------------------------------------------------
+# Backend: un blocco per ogni indirizzo del nome
+# -------------------------------------------------------
+# Varnish risolve il nome del backend quando COMPILA il VCL, non ad ogni
+# richiesta, e accetta un solo IPv4 per backend. Qui si enumerano tutti
+# gli indirizzi a cui risponde il nome e si genera un backend per
+# ciascuno, poi messi dietro a un director (vedi default.vcl.template).
+BACKEND_HOST="${BACKEND_HOST:-wordpress}"
+BACKEND_PORT="${BACKEND_PORT:-80}"
+
+# Attesa del DNS: normalmente il depends_on la rende istantanea, serve
+# nei riavvii in cui l'ordine non e' garantito.
+tries=60
+BACKEND_IPS=""
+while [ "${tries}" -gt 0 ]; do
+    BACKEND_IPS=$(getent ahostsv4 "${BACKEND_HOST}" 2>/dev/null | awk '{print $1}' | sort -u)
+    [ -n "${BACKEND_IPS}" ] && break
+    tries=$(( tries - 1 ))
+    [ "${tries}" -eq 55 ] && echo "In attesa che '${BACKEND_HOST}' sia risolvibile..."
+    sleep 2
+done
+
+if [ -z "${BACKEND_IPS}" ]; then
+    echo "ERRORE: '${BACKEND_HOST}' non risolvibile dopo 120s. Varnish non puo' compilare il VCL." >&2
+    exit 1
+fi
+
+BACKENDS_FILE=$(mktemp)
+MEMBERS_FILE=$(mktemp)
+n=0
+for ip in ${BACKEND_IPS}; do
+    n=$(( n + 1 ))
+    cat >> "${BACKENDS_FILE}" <<EOF
+backend wp_${n} {
+    .host                   = "${ip}";
+    .port                   = "${BACKEND_PORT}";
+    .connect_timeout        = 5s;
+    .first_byte_timeout     = ${VARNISH_BACKEND_TIMEOUT}s;
+    .between_bytes_timeout  = 60s;
+    .max_connections        = 500;
+    .probe                  = wp_healthz;
+}
+
+EOF
+    echo "    wp_cluster.add_backend(wp_${n});" >> "${MEMBERS_FILE}"
+done
+
+if [ "${n}" -eq 1 ]; then
+    echo "Varnish: backend ${BACKEND_HOST} -> ${BACKEND_IPS}"
+else
+    echo "Varnish: '${BACKEND_HOST}' risolve a ${n} indirizzi, generati ${n} backend dietro a un director."
+    echo "         $(echo ${BACKEND_IPS} | tr '\n' ' ')"
+    echo "         Se non ti aspetti ${n} container, controlla che non ne siano"
+    echo "         rimasti attaccati alla rete da un deploy precedente."
+fi
+
+# -------------------------------------------------------
 # Generazione del VCL
 # -------------------------------------------------------
 if [ ! -r "${TEMPLATE}" ]; then
@@ -80,36 +136,19 @@ if [ ! -r "${TEMPLATE}" ]; then
     exit 1
 fi
 
-sed -e "s|@BACKEND_TIMEOUT@|${VARNISH_BACKEND_TIMEOUT}|g" \
-    -e "s|@DEFAULT_TTL@|${VARNISH_TTL}|g" \
+sed -e "s|@DEFAULT_TTL@|${VARNISH_TTL}|g" \
     -e "s|@STATIC_TTL@|${VARNISH_STATIC_TTL}|g" \
     -e "s|@GRACE@|${VARNISH_GRACE}|g" \
     "${TEMPLATE}" > "${TARGET}"
 
 sed -i -e "/@ENCODING_BLOCK@/r ${ENC_FILE}" -e "/@ENCODING_BLOCK@/d" "${TARGET}"
-rm -f "${ENC_FILE}"
+sed -i -e "/@BACKENDS@/r ${BACKENDS_FILE}" -e "/@BACKENDS@/d" "${TARGET}"
+sed -i -e "/@DIRECTOR_MEMBERS@/r ${MEMBERS_FILE}" -e "/@DIRECTOR_MEMBERS@/d" "${TARGET}"
+rm -f "${ENC_FILE}" "${BACKENDS_FILE}" "${MEMBERS_FILE}"
 
 if grep -q '@[A-Z_]\{3,\}@' "${TARGET}"; then
     echo "ERRORE: segnaposto non sostituiti nel VCL:" >&2
     grep -n '@[A-Z_]\{3,\}@' "${TARGET}" >&2
-    exit 1
-fi
-
-# Varnish risolve il nome del backend quando COMPILA il VCL, non ad ogni
-# richiesta. Se "wordpress" non e' ancora nel DNS di Docker la
-# compilazione fallisce e il container muore, quindi si aspetta.
-# Normalmente il depends_on rende l'attesa istantanea; serve nei riavvii
-# in cui l'ordine non e' garantito.
-BACKEND_HOST="${BACKEND_HOST:-wordpress}"
-tries=60
-while [ "${tries}" -gt 0 ]; do
-    getent hosts "${BACKEND_HOST}" > /dev/null 2>&1 && break
-    tries=$(( tries - 1 ))
-    [ "${tries}" -eq 55 ] && echo "In attesa che '${BACKEND_HOST}' sia risolvibile..."
-    sleep 2
-done
-if [ "${tries}" -eq 0 ]; then
-    echo "ERRORE: '${BACKEND_HOST}' non risolvibile dopo 120s. Varnish non puo' compilare il VCL." >&2
     exit 1
 fi
 
