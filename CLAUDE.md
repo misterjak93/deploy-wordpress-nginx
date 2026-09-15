@@ -137,6 +137,21 @@ più `phpX.Y-opcache`. Il pacchetto sta fra gli opzionali, ma OPcache
 resta obbligatorio come *capacità*: il build interroga l'interprete, che
 è la prova valida comunque venga distribuito.
 
+### WP-CLI gira come www-data ma HOME sarebbe di root
+
+Senza `HOME` esportato in `scripts/wp`, ogni comando stampa
+`Failed to create directory '/root/.wp-cli/cache/'` e la cache dei
+download non funziona. `setpriv` non ripulisce l'ambiente, quindi
+esportarlo nel wrapper basta.
+
+### Il cron non deve loggare a ogni giro
+
+Fra il primo avvio e l'installazione dal browser possono passare giorni,
+e in quel periodo ogni esecuzione fallisce. Il runner aspetta che
+`wp core is-installed` risponda prima di iniziare, e nel ciclo stampa un
+errore solo quando **cambia**: un problema persistente si segnala una
+volta, non una al minuto.
+
 ### Compose: niente sintassi `${VAR:?...}`
 
 Fa fallire l'interpolazione con errore, e Dokploy rilegge e riscrive il
@@ -211,6 +226,11 @@ Dokploy).
 **Varnish non partiva:** `cannot create /etc/varnish/default.vcl:
 Permission denied`. Vedi *Varnish gira come utente non-root* qui sopra.
 Nella stessa occasione è emerso che `varnishd -C` scrive su stderr.
+
+**Pulizia dei log dopo il primo avvio riuscito:** il cron ripeteva
+"The site you have requested is not installed" ogni minuto in attesa
+dell'installazione, WP-CLI si lamentava di `/root/.wp-cli`, e Varnish
+segnalava `mlock() of VSM failed` per via del limite `memlock` a 8 MB.
 
 **Varnish non partiva, secondo giro:** `Backend host "wordpress":
 resolves to too many addresses` — tre indirizzi sulla rete interna. Da qui

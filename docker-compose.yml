@@ -53,6 +53,15 @@ services:
       # varnish non potrebbe scriverci. Tutto cio' che finisce qui viene
       # comunque rigenerato ad ogni avvio.
       - /tmp/varnish:mode=1777,size=16m
+    # Varnish blocca in RAM il proprio segmento di memoria condivisa (VSM).
+    # Il limite di default del container e' 8 MB e non basta: all'avvio
+    # logga "mlock() of VSM failed: Cannot allocate memory". Non e' fatale
+    # - il VSM serve a varnishlog e varnishstat - ma senza mlock quelle
+    # pagine possono finire in swap proprio mentre servono.
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     healthcheck:
       test: ["CMD-SHELL", "varnishadm -T 127.0.0.1:6082 -S /tmp/varnish/secret ping || exit 1"]
       interval: 30s
