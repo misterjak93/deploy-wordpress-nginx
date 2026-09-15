@@ -34,6 +34,15 @@ final class Stack_Cache {
 	public const OPTION     = 'stack_cache_settings';
 	public const QUEUE      = 'stack_cache_preload_queue';
 	public const STATS      = 'stack_cache_stats';
+
+	/**
+	 * Contatore incrementato ad ogni svuotamento totale. Entra nel
+	 * calcolo dell'ETag, quindi "Svuota tutto" invalida anche le copie
+	 * che stanno nei browser dei visitatori: senza, il pulsante direbbe
+	 * di aver svuotato la cache e una parte del pubblico continuerebbe a
+	 * rivedere la pagina vecchia dal proprio disco.
+	 */
+	public const GENERATION = 'stack_cache_generation';
 	public const CRON_HOOK  = 'stack_cache_preload_tick';
 	public const SITEMAP_HOOK = 'stack_cache_collect_sitemap';
 	public const TRASH_HOOK = 'stack_cache_trash_tick';
@@ -82,7 +91,48 @@ final class Stack_Cache {
 		$this->settings = $this->load_settings();
 
 		// Percorso caldo: su ogni richiesta pubblica gira solo questo.
-		add_action( 'send_headers', array( $this, 'send_cache_headers' ), 99 );
+		//
+		// Il gancio e' 'template_redirect', non 'send_headers', e non e'
+		// una preferenza di stile. WP::main() esegue in quest'ordine:
+		// parse_request(), send_headers(), query_posts(), handle_404().
+		// Su 'send_headers' la query principale non e' ancora partita,
+		// quindi is_404(), is_feed(), is_search(), is_singular() e le
+		// condizionali di WooCommerce rispondono tutte "false": il plugin
+		// dichiarava "pagina pubblica" - cioe' trenta giorni di TTL su
+		// nginx - anche per un 404, per una ricerca o per il carrello. Le
+		// mappe di nginx ne fermavano una parte, ed e' l'unica ragione per
+		// cui il guasto non si e' mai visto.
+		//
+		// 'template_redirect' scatta a query conclusa e prima di qualunque
+		// output, ed e' anche il primo punto in cui l'oggetto interrogato
+		// esiste: senza di lui non si puo' calcolare un Last-Modified.
+		//
+		// La priorita' e' alta di proposito, per stare dopo
+		// redirect_canonical (10): su una richiesta che finisce in 301
+		// quel gancio chiude la risposta e chiama exit, quindi qui non si
+		// arriva affatto e il 301 esce senza header di cache. E' corretto:
+		// un redirect non e' contenuto di cui questo plugin sappia
+		// qualcosa.
+		add_action( 'template_redirect', array( $this, 'send_cache_headers' ), 1000 );
+
+		// La REST API non passa di li'. rest_api_loaded() e' agganciata a
+		// 'parse_request', serve la richiesta e chiama die(): 'send_headers'
+		// e 'template_redirect' non vengono mai eseguiti. Per questo ogni
+		// risposta REST usciva senza X-Accel-Expires, e nginx la
+		// memorizzava con il proprio FASTCGI_CACHE_TTL. Vedi rest_no_store().
+		add_filter( 'rest_post_dispatch', array( $this, 'rest_no_store' ), PHP_INT_MAX, 1 );
+
+		// Due header "Link" che WordPress emette su ogni pagina pubblica:
+		// la discovery della REST API e lo shortlink. Viaggiano su ogni
+		// risposta e finiscono in cache insieme ad essa, e nessun browser
+		// ne fa niente. La discovery resta all'indirizzo di sempre
+		// (/wp-json/), solo non viene piu' annunciata in un header.
+		//
+		// Si possono togliere da qui perche' i must-use plugin vengono
+		// caricati da wp-settings.php DOPO default-filters.php, che e' dove
+		// i due ganci vengono registrati.
+		remove_action( 'template_redirect', 'rest_output_link_header', 11 );
+		remove_action( 'template_redirect', 'wp_shortlink_header', 11 );
 
 		add_action( 'init', array( $this, 'register_automations' ) );
 
@@ -114,6 +164,14 @@ final class Stack_Cache {
 			'ttl_varnish'      => 3600,    // 1 ora
 			'ttl_feed'         => 1800,
 			'ttl_404'          => 60,
+			// Quanto puo' tenersi l'HTML il browser del visitatore.
+			// Zero di proposito: la cache condivisa la sappiamo
+			// invalidare, quella dentro al portatile di un lettore no.
+			// Con Last-Modified ed ETag attivi, zero non significa
+			// "riscaricare ogni volta" ma "richiedere ogni volta", e la
+			// risposta e' quasi sempre un 304 senza corpo.
+			'ttl_browser'      => 0,
+			'validators'       => true,
 			'cache_404'        => true,
 			'cache_feed'       => true,
 			'purge_scope'      => 'related', // 'related' | 'all'
@@ -213,12 +271,9 @@ final class Stack_Cache {
 				|| str_starts_with( $name, 'woocommerce_items_in_cart' )
 				|| str_starts_with( $name, 'wp_woocommerce_session_' )
 				|| str_starts_with( $name, 'edd_items_in_cart' ) ) {
-				// Il nome del cookie lo sceglie chi chiama, e questa stringa
-				// esce in un header di risposta (X-WP-Cache-Reason). PHP
-				// rifiuta CR e LF in header(), quindi non e' header
-				// injection, ma far tornare indietro testo arbitrario da un
-				// endpoint diagnostico e' superficie regalata: si nomina la
-				// famiglia, non il cookie.
+				// Il nome del cookie lo sceglie chi chiama: si nomina la
+				// famiglia, non il cookie. La ragione non esce piu' in un
+				// header, ma resta una stringa che puo' finire in un log.
 				return $no( 'cookie di sessione' );
 			}
 		}
@@ -271,15 +326,301 @@ final class Stack_Cache {
 		header( 'X-Accel-Expires: ' . ( $v['cacheable'] ? $v['nginx'] : 0 ) );
 		header( 'X-WP-Varnish-TTL: ' . ( $v['cacheable'] ? $v['varnish'] : 0 ) );
 
-		// Utile in diagnosi: dice perche' una pagina non e' finita in
-		// cache, che e' la domanda piu' frequente. Varnish e nginx non
-		// lo rimuovono: e' informativo e non rivela nulla.
-		header( 'X-WP-Cache-Reason: ' . $v['reason'] );
-
 		if ( ! $v['cacheable'] ) {
 			// Il browser non deve tenersi una pagina personale.
 			header( 'Cache-Control: no-store, no-cache, must-revalidate, max-age=0' );
+			return;
 		}
+
+		// Cosa puo' farne il browser. Lo decide il plugin perche' e'
+		// l'unico dei tre livelli che sa se questa pagina e' pubblica: il
+		// VCL non riscrive piu' Cache-Control quando arriva dal backend.
+		header( 'Cache-Control: ' . $this->browser_cache_control() );
+
+		$this->send_validators();
+	}
+
+	/**
+	 * Politica di cache per il browser del visitatore.
+	 *
+	 * "s-maxage=0" e' fisso e non segue il TTL di Varnish, che il proprio
+	 * se lo prende da X-WP-Varnish-TTL. s-maxage parla a una eventuale CDN
+	 * davanti a Traefik, e quella non la sappiamo invalidare: annunciarle
+	 * un'ora vorrebbe dire un'ora di contenuto vecchio che nessun pulsante
+	 * di questa bacheca puo' raggiungere.
+	 */
+	private function browser_cache_control(): string {
+		$ttl = max( 0, (int) $this->get( 'ttl_browser' ) );
+
+		return 'public, max-age=' . $ttl . ', s-maxage=0, must-revalidate';
+	}
+
+	/**
+	 * Last-Modified, ETag e risposta alle richieste condizionali.
+	 *
+	 * A cosa servono, visto che davanti ci sono gia' due cache: a non
+	 * rispedire il corpo. Con max-age a zero il browser ricontrolla ad
+	 * ogni visita, ma se porta con se' il validatore che gli abbiamo dato
+	 * la risposta e' un 304 di poche centinaia di byte invece di una
+	 * pagina intera. Su un lettore che torna, e su ogni crawler, e' la
+	 * differenza fra rimandare 90 KB e rimandare niente.
+	 *
+	 * I due validatori sono anche cio' che permette a Varnish di
+	 * rispondere 304 da solo, senza svegliare nginx: senza ETag
+	 * nell'oggetto memorizzato, una richiesta condizionale in HIT si
+	 * porta dietro il corpo lo stesso.
+	 */
+	private function send_validators(): void {
+		if ( ! $this->get( 'validators' ) ) {
+			return;
+		}
+
+		// Su un 404 non c'e' niente da validare: la pagina non esiste e la
+		// sua "data di modifica" sarebbe inventata.
+		if ( is_404() ) {
+			return;
+		}
+
+		// Sui feed lo fa gia' WordPress: WP::send_headers() emette
+		// Last-Modified ed ETag e risponde 304 da solo. Rifarlo qui
+		// significherebbe due header per nome, e il secondo vincerebbe.
+		if ( is_feed() ) {
+			return;
+		}
+
+		$ts = $this->last_modified_ts();
+		if ( $ts <= 0 ) {
+			return;
+		}
+
+		$etag = $this->etag_for( $ts );
+
+		header( 'Last-Modified: ' . gmdate( 'D, d M Y H:i:s', $ts ) . ' GMT' );
+		header( 'ETag: ' . $etag );
+
+		if ( ! $this->client_is_current( $etag, $ts ) ) {
+			return;
+		}
+
+		// 304: i validatori e la politica di cache restano, il corpo no.
+		// L'uscita anticipata non salta le invalidazioni accumulate:
+		// quelle girano su 'shutdown', che exit() esegue comunque.
+		status_header( 304 );
+		header_remove( 'Content-Type' );
+		header_remove( 'Content-Length' );
+
+		// E i due livelli non devono MEMORIZZARE questa risposta. Senza
+		// queste due righe uscirebbe con il TTL calcolato poco sopra, e
+		// X-Accel-Expires vince su tutto: nginx memorizzerebbe un 304 -
+		// che normalmente non e' fra gli stati cacheabili - e lo
+		// servirebbe poi a chi non ha mandato nessun validatore, cioe'
+		// una pagina senza corpo a chi la chiede per la prima volta.
+		//
+		// Nella configurazione predefinita questo ramo non viene mai
+		// eseguito, perche' con la cache accesa nginx toglie gli header
+		// condizionali prima del backend. Vale per quando e' spenta.
+		header( 'X-Accel-Expires: 0' );
+		header( 'X-WP-Varnish-TTL: 0' );
+		exit;
+	}
+
+	/**
+	 * La data della cosa piu' recente che compone questa risposta.
+	 *
+	 * Non e' "l'ultima modifica del sito": un archivio che mostra dieci
+	 * articoli cambia quando cambia uno qualunque dei dieci, e una pagina
+	 * singola cambia anche quando arriva un commento - senza che
+	 * post_modified si muova di un secondo.
+	 */
+	private function last_modified_ts(): int {
+		$date = array();
+
+		if ( is_singular() ) {
+			$post = get_queried_object();
+			if ( $post instanceof WP_Post ) {
+				$date[] = (int) get_post_modified_time( 'U', true, $post );
+
+				// Un commento cambia la pagina senza toccare
+				// post_modified. Senza questa riga un lettore che ha gia'
+				// visto l'articolo riceverebbe 304 e non vedrebbe mai i
+				// commenti nuovi: il guasto sarebbe silenzioso, come tutti
+				// i peggiori di questo stack. La query e' una sola riga su
+				// una colonna indicizzata, e gira solo quando la pagina la
+				// si sta generando davvero - cioe' quando entrambe le
+				// cache hanno gia' fatto MISS.
+				if ( (int) $post->comment_count > 0 ) {
+					$ultimo = get_comments(
+						array(
+							'post_id' => $post->ID,
+							'status'  => 'approve',
+							'number'  => 1,
+							'orderby' => 'comment_date_gmt',
+							'order'   => 'DESC',
+						)
+					);
+					if ( ! empty( $ultimo[0]->comment_date_gmt ) ) {
+						$date[] = (int) strtotime( $ultimo[0]->comment_date_gmt . ' GMT' );
+					}
+				}
+			}
+		} elseif ( ! empty( $GLOBALS['wp_query']->posts ) ) {
+			foreach ( $GLOBALS['wp_query']->posts as $p ) {
+				if ( $p instanceof WP_Post && $p->post_modified_gmt ) {
+					$date[] = (int) strtotime( $p->post_modified_gmt . ' GMT' );
+				}
+			}
+		}
+
+		if ( ! $date ) {
+			// Homepage statica senza loop, pagina di un plugin, archivio
+			// vuoto: si ripiega sull'ultima modifica del sito.
+			$ultima = get_lastpostmodified( 'GMT' );
+			if ( $ultima ) {
+				$date[] = (int) strtotime( $ultima . ' GMT' );
+			}
+		}
+
+		$date = array_filter( $date, static fn( int $t ): bool => $t > 0 );
+		if ( ! $date ) {
+			return 0;
+		}
+
+		// Un contenuto programmato, o un orologio avanti, darebbero un
+		// Last-Modified nel futuro: per la RFC e' invalido, e qualche
+		// proxy lo legge come "fresco per sempre".
+		return min( max( $date ), time() );
+	}
+
+	/**
+	 * ETag della risposta corrente.
+	 *
+	 * Debole di proposito (il prefisso W/). Fra PHP e il visitatore il
+	 * corpo viene ricompresso da nginx in gzip, brotli o zstd: un ETag
+	 * forte smetterebbe di descrivere i byte consegnati davvero. Il modulo
+	 * gzip lo degrada da solo a debole, gli altri due non
+	 * necessariamente; dichiararlo debole da subito toglie la
+	 * discrepanza, e per una richiesta condizionale il confronto debole e'
+	 * comunque quello giusto.
+	 *
+	 * Nell'impronta entrano la data calcolata sopra, l'indirizzo completo
+	 * - host compreso, perche' lo stesso percorso su due domini non e' la
+	 * stessa pagina - e il contatore di generazione, che sale ad ogni
+	 * svuotamento totale.
+	 */
+	private function etag_for( int $ts ): string {
+		$parti = array(
+			(string) self::generation(),
+			(string) $ts,
+			$this->site_host(),
+			(string) ( $_SERVER['REQUEST_URI'] ?? '/' ),
+		);
+
+		return 'W/"' . md5( implode( '|', $parti ) ) . '"';
+	}
+
+	/**
+	 * Il client ha gia' questa versione?
+	 *
+	 * Quando manda un ETag comanda quello e If-Modified-Since diventa
+	 * irrilevante: e' il validatore preciso, mentre la data ha la
+	 * risoluzione di un secondo e non sa niente dei commenti arrivati
+	 * nello stesso secondo.
+	 */
+	private function client_is_current( string $etag, int $ts ): bool {
+		$inm = trim( (string) ( $_SERVER['HTTP_IF_NONE_MATCH'] ?? '' ) );
+
+		if ( '' !== $inm ) {
+			if ( '*' === $inm ) {
+				return true;
+			}
+
+			$nudo = static fn( string $t ): string => trim(
+				(string) preg_replace( '/^\s*W\//', '', trim( $t ) )
+			);
+			$mio  = $nudo( $etag );
+
+			foreach ( explode( ',', $inm ) as $candidato ) {
+				if ( $nudo( $candidato ) === $mio ) {
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		$ims = trim( (string) ( $_SERVER['HTTP_IF_MODIFIED_SINCE'] ?? '' ) );
+		if ( '' === $ims ) {
+			return false;
+		}
+
+		$visto = strtotime( $ims );
+
+		return false !== $visto && $visto >= $ts;
+	}
+
+	/**
+	 * Generazione corrente del sito: sale ad ogni svuotamento totale.
+	 *
+	 * Entra nell'ETag, quindi "Svuota tutto" invalida anche le copie che
+	 * i visitatori hanno nel proprio browser. Senza, il pulsante direbbe
+	 * di aver svuotato la cache mentre una parte del pubblico continua a
+	 * rivedere la pagina vecchia dal proprio disco, e nessuno se ne
+	 * accorgerebbe: l'ennesima cache che risponde qualcosa che non e' un
+	 * errore.
+	 *
+	 * Le invalidazioni mirate non la toccano: la data di modifica del
+	 * contenuto cambia da sola, e alzare la generazione per un articolo
+	 * scaderebbe i validatori di tutto il sito.
+	 */
+	public static function generation(): int {
+		return max( 1, (int) get_option( self::GENERATION, 1 ) );
+	}
+
+	private function bump_generation(): void {
+		update_option( self::GENERATION, self::generation() + 1, true );
+	}
+
+	/**
+	 * La REST API non e' contenuto di pagina, e non deve mai finire in una
+	 * cache condivisa.
+	 *
+	 * Questo filtro esiste perche' nessuno degli altri ganci del plugin
+	 * viene eseguito su una richiesta REST: rest_api_loaded() e'
+	 * agganciata a 'parse_request', serve la risposta e chiama die(),
+	 * quindi 'send_headers' e 'template_redirect' non arrivano mai. Le
+	 * risposte REST uscivano percio' senza X-Accel-Expires e senza
+	 * X-WP-Varnish-TTL, e i due livelli applicavano i propri default:
+	 * FASTCGI_CACHE_TTL su nginx (trenta giorni) e VARNISH_TTL in RAM.
+	 *
+	 * Il danno non e' "una risposta un po' vecchia". La REST API e' anche
+	 * il canale con cui un client esterno - un'app, un server MCP -
+	 * scopre di cosa e' capace questo sito e a quali indirizzi parlargli.
+	 * Una copia vecchia dell'indice delle rotte gli fa cercare endpoint
+	 * che non esistono piu' o ignorare quelli appena comparsi, e siccome
+	 * la copia scade da sola il guasto va e viene: la connessione riesce,
+	 * poi cade, poi riesce di nuovo. E' la stessa forma gia' vista con i
+	 * documenti di discovery sotto /.well-known/, solo su un altro
+	 * indirizzo.
+	 *
+	 * Nemmeno l'invalidazione avrebbe potuto rimediare: purge_post()
+	 * conosce permalink, archivi e feed, non le rotte REST che li
+	 * espongono. Le voci sarebbero rimaste fino a "inactive".
+	 *
+	 * Le mappe di nginx e il VCL dicono la stessa cosa. Qui e' il punto in
+	 * cui la dice WordPress, che e' l'unico a saperlo anche quando la
+	 * rotta la registra un plugin installato stamattina.
+	 *
+	 * @param mixed $response Risposta gia' pronta per essere servita.
+	 * @return mixed
+	 */
+	public function rest_no_store( mixed $response ): mixed {
+		if ( $response instanceof WP_REST_Response ) {
+			$response->header( 'X-Accel-Expires', '0' );
+			$response->header( 'X-WP-Varnish-TTL', '0' );
+			$response->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0' );
+		}
+
+		return $response;
 	}
 
 	// =========================================================
@@ -776,6 +1117,11 @@ final class Stack_Cache {
 			'redis'   => $this->purge_redis(),
 			'opcache' => $this->purge_opcache(),
 		);
+
+		// La copia che sta nel browser del visitatore non la raggiunge
+		// nessun PURGE: l'unico modo di scaderla e' cambiare il
+		// validatore che le abbiamo dato. Vedi generation().
+		$this->bump_generation();
 
 		$this->bump_stat( 'purge_all' );
 
@@ -1335,11 +1681,13 @@ final class Stack_Cache {
 		$new['cache_feed']       = ! empty( $in['cache_feed'] );
 		$new['preload_enabled']  = ! empty( $in['preload_enabled'] );
 		$new['preload_on_purge'] = ! empty( $in['preload_on_purge'] );
+		$new['validators']       = ! empty( $in['validators'] );
 
 		$new['ttl_nginx']     = max( 0, (int) ( $in['ttl_nginx'] ?? 0 ) );
 		$new['ttl_varnish']   = max( 0, (int) ( $in['ttl_varnish'] ?? 0 ) );
 		$new['ttl_feed']      = max( 0, (int) ( $in['ttl_feed'] ?? 0 ) );
 		$new['ttl_404']       = max( 0, (int) ( $in['ttl_404'] ?? 0 ) );
+		$new['ttl_browser']   = max( 0, (int) ( $in['ttl_browser'] ?? 0 ) );
 		$new['preload_batch'] = max( 1, min( 50, (int) ( $in['preload_batch'] ?? 5 ) ) );
 
 		$new['purge_scope'] = 'all' === ( $in['purge_scope'] ?? '' ) ? 'all' : 'related';
@@ -1519,6 +1867,53 @@ final class Stack_Cache {
 					</tr>
 				</table>
 
+				<h2>Browser del visitatore</h2>
+				<p class="description" style="max-width:52em">
+					Il terzo posto in cui una pagina può restare ferma, dopo Varnish e nginx — con una
+					differenza importante: è l'unico che nessun pulsante di questa schermata può
+					raggiungere. Quello che un browser ha già scaricato resta suo fino alla scadenza.
+				</p>
+				<table class="form-table" role="presentation">
+					<tr>
+						<th scope="row">Validatori</th>
+						<td>
+							<label><input type="checkbox" name="validators" value="1" <?php checked( $this->get( 'validators' ) ); ?>>
+								Invia <code>Last-Modified</code> ed <code>ETag</code></label>
+							<p class="description">
+								Il browser che torna chiede "è cambiata?" e quasi sempre riceve un
+								<code>304</code> di poche centinaia di byte invece della pagina intera.
+								Vale anche per Varnish, che con un <code>ETag</code> in cache risponde 304
+								da solo senza disturbare nginx.
+							</p>
+						</td>
+					</tr>
+					<tr>
+						<th scope="row"><label for="ttl_browser">Durata locale dell'HTML</label></th>
+						<td>
+							<input id="ttl_browser" type="number" min="0" name="ttl_browser" value="<?php echo esc_attr( (string) $this->get( 'ttl_browser' ) ); ?>" class="small-text"> secondi
+							<p class="description">
+								Zero è il valore giusto per quasi tutti i siti: con i validatori attivi non
+								significa "riscaricare ogni volta" ma "richiedere ogni volta", e la risposta
+								è un 304 vuoto. Alzarlo rende il ritorno istantaneo, ma per quei secondi una
+								correzione pubblicata non raggiunge chi ha già visitato la pagina.
+							</p>
+							<p class="description">
+								Immagini, CSS e font non passano di qui: li serve nginx, con un anno di
+								cache e l'indirizzo che cambia ad ogni nuova versione
+								(<code>?ver=</code>). Si regolano dal <code>.env</code>, con
+								<code>STATIC_BROWSER_TTL</code>
+								<?php
+								$sbt = (int) ( getenv( 'STATIC_BROWSER_TTL' ) ?: 31536000 );
+								printf(
+									' (adesso %s).',
+									esc_html( number_format_i18n( $sbt ) . ' secondi' )
+								);
+								?>
+							</p>
+						</td>
+					</tr>
+				</table>
+
 				<h2>Automazioni</h2>
 				<p class="description">Quando questi eventi accadono, la cache viene invalidata da sola.</p>
 				<table class="form-table" role="presentation">
@@ -1589,12 +1984,15 @@ final class Stack_Cache {
 			<p class="description" style="max-width:52em">
 				Ogni risposta porta con sé l'esito dei due livelli. Da terminale:
 			</p>
-			<pre style="background:#f6f7f7;padding:1rem;overflow:auto"><code>curl -sI <?php echo esc_html( home_url( '/' ) ); ?> | grep -i 'x-cache\|x-nginx-cache\|x-wp-cache-reason'</code></pre>
+			<pre style="background:#f6f7f7;padding:1rem;overflow:auto"><code>curl -sI <?php echo esc_html( home_url( '/' ) ); ?> | grep -i 'x-cache\|x-nginx-cache\|etag\|last-modified\|cache-control'</code></pre>
 			<p class="description" style="max-width:52em">
-				<code>X-Cache</code> è Varnish, <code>X-Nginx-Cache</code> è il livello su disco,
-				<code>X-WP-Cache-Reason</code> dice perché una pagina non è stata memorizzata.
+				<code>X-Cache</code> è Varnish, <code>X-Nginx-Cache</code> è il livello su disco.
 				Da loggato vedrai sempre <code>MISS</code> e <code>BYPASS</code>: è corretto.
 			</p>
+			<p class="description" style="max-width:52em">
+				Per vedere un 304 servito davvero, rimandare indietro l'<code>ETag</code> ricevuto:
+			</p>
+			<pre style="background:#f6f7f7;padding:1rem;overflow:auto"><code>curl -sI <?php echo esc_html( home_url( '/' ) ); ?> -H 'If-None-Match: &lt;etag&gt;' | head -1</code></pre>
 		</div>
 		<?php
 	}

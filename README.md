@@ -292,11 +292,21 @@ varnishstat -1 | grep -E 'cache_hit|cache_miss|n_object'
 varnishlog -g request -q 'ReqURL ~ "/"'
 ```
 
-### **Perché l'HTML esce con `max-age=0`**
+### **Il browser del visitatore, terzo livello**
 
-Varnish imposta `Cache-Control: public, max-age=0, s-maxage=0, must-revalidate` sull'HTML. Non è una svista: la cache condivisa è Varnish, ed è l'unica che sappiamo invalidare. Se l'HTML restasse anche nel browser, un articolo corretto resterebbe vecchio per ore su quel dispositivo e nessun purge potrebbe raggiungerlo.
+È il terzo posto in cui una risposta può restare ferma, dopo Varnish e nginx, ed è l'unico che **nessun pulsante della bacheca può raggiungere**: quello che un browser ha già scaricato resta suo fino alla scadenza.
 
-Gli asset statici, che sono versionati da WordPress via `?ver=`, escono invece con un anno di `immutable`.
+Per questo l'HTML esce con `Cache-Control: public, max-age=0, s-maxage=0, must-revalidate`. La cache condivisa che sappiamo invalidare è Varnish; se l'HTML restasse anche nel browser, un articolo corretto resterebbe vecchio per ore su quel dispositivo. Il valore lo decide il mu-plugin (*Durata locale dell'HTML*, zero di default) e si può alzare sapendo cosa si sta comprando.
+
+`max-age=0` non significa però "riscaricare ogni volta". Ogni pagina pubblica esce con **`Last-Modified` e `ETag`**, quindi il browser che torna chiede *"è cambiata?"* e quasi sempre riceve un `304` di poche centinaia di byte invece della pagina intera.
+
+I due validatori servono soprattutto ai due livelli davanti: con un `ETag` nell'oggetto memorizzato **Varnish risponde 304 da solo**, senza nemmeno disturbare nginx, e nginx fa lo stesso per quello che serve dalla propria cache di pagina. Misurato: una richiesta condizionale su una pagina in `HIT` torna `304` con `X-Cache: HIT` e zero byte di corpo.
+
+Il `Last-Modified` non è "l'ultima modifica del sito": su una pagina singola è la più recente fra la modifica del contenuto e l'ultimo commento approvato — senza quest'ultimo, chi ha già letto l'articolo riceverebbe 304 e non vedrebbe mai i commenti nuovi. Su un archivio è il più recente dei contenuti mostrati.
+
+Nell'`ETag` entra anche un contatore che sale ad ogni **svuotamento totale**: così "Svuota tutto" scade anche le copie che stanno nei browser, invece di dire di aver svuotato la cache mentre una parte del pubblico continua a vedere la versione precedente.
+
+Gli asset statici li serve nginx e non passano dal plugin: durata in `STATIC_BROWSER_TTL` (un anno di default). CSS e JavaScript escono con `immutable`, perché WordPress li pubblica con `?ver=` e una modifica cambia l'indirizzo; le immagini in `uploads` **no**, perché lì il nome del file non cambia mai quando il file cambia e una ricarica forzata deve poter raccogliere la sostituzione.
 
 ---
 
@@ -390,12 +400,10 @@ manca in **entrambi**.
 Ogni risposta dichiara l'esito dei due livelli:
 
 ```bash
-curl -sI https://tuosito.com/ | grep -i 'x-cache\|x-nginx-cache\|x-wp-cache-reason'
+curl -sI https://tuosito.com/ | grep -i 'x-cache\|x-nginx-cache\|etag\|cache-control'
 ```
 
-`X-Cache` è Varnish, `X-Nginx-Cache` il livello su disco, e
-`X-WP-Cache-Reason` dice **perché** una pagina non è stata memorizzata —
-la domanda più frequente quando una cache "non prende".
+`X-Cache` è Varnish, `X-Nginx-Cache` il livello su disco.
 
 `X-Cache` ha tre valori: `HIT`, `MISS` (cercata e non trovata) e
 `BYPASS` (richiesta amministrativa, Varnish non ha nemmeno guardato).
@@ -418,7 +426,24 @@ due livelli capiscono nativamente:
 | nginx | `X-Accel-Expires` | supportato nativamente, vince su `Cache-Control` |
 | Varnish | `X-WP-Varnish-TTL` | letto in `vcl_backend_response` |
 
-Nessuno dei due esce mai verso il visitatore.
+Nessuno dei due esce mai verso il visitatore. Verso il visitatore vanno
+invece `Cache-Control`, `Last-Modified` ed `ETag`, che il plugin calcola
+sulla stessa decisione.
+
+**La REST API non entra in nessuna delle due cache.** Non è contenuto di
+pagina ma il canale con cui un client esterno — un'app, un server MCP —
+scopre a quali indirizzi parlare con questo sito e poi ci parla; una copia
+vecchia dell'indice delle rotte non mostra una pagina vecchia, fa cercare
+endpoint che non esistono, e siccome scade da sola il guasto va e viene.
+La regola vale per entrambe le forme di URL (`/wp-json/…` e
+`?rest_route=…`) ed è scritta in tre posti che devono dire la stessa cosa:
+il VCL, le mappe di nginx e il plugin.
+
+Il plugin toglie anche i due header `Link` che WordPress emette su ogni
+pagina pubblica (discovery della REST API e shortlink): viaggiavano su
+ogni risposta e finivano in cache insieme ad essa. `/wp-json/` resta
+raggiungibile all'indirizzo di sempre, semplicemente non viene più
+annunciato in un header.
 
 Dalla voce **Cache** in bacheca: stato dei quattro livelli, svuotamento
 singolo o totale, invalidazione di un indirizzo, TTL separati per i due
@@ -679,13 +704,21 @@ Copia `.env.example` e personalizzalo. Le variabili sono raggruppate per area e 
 curl -sI https://tuosito.com/ | grep -i x-cache
 ```
 
-`X-Cache: HIT` con `X-Cache-Hits` crescente. Se resta sempre `MISS`:
+`X-Cache: HIT` alla seconda richiesta. Se resta sempre `MISS`:
 
 - sei loggato — la sessione esclude dalla cache, è corretto; prova in finestra anonima;
 - un plugin manda `Set-Cookie` su ogni risposta: una risposta che imposta cookie non viene cachata, perché è quasi sempre personale;
 - un plugin manda `Cache-Control: no-cache`: Varnish lo rispetta.
 
 Per capire quale: `varnishlog -g request -q 'ReqURL eq "/"'` dal terminale di **varnish**.
+
+Per verificare che una richiesta condizionale costi zero, rimandare
+indietro l'`ETag` ricevuto: la risposta deve essere `304` senza corpo.
+
+```bash
+ET=$(curl -sI https://tuosito.com/ | tr -d '\r' | awk -F': ' '/^[Ee][Tt]ag/{print $2}')
+curl -sI https://tuosito.com/ -H "If-None-Match: $ET" | head -1
+```
 
 ### **Verificare la compressione**
 

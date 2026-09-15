@@ -221,13 +221,17 @@ sub vcl_recv {
     }
 
     # ---------------------------------------------------
-    # Discovery e endpoint OAuth/MCP: mai da cache
+    # REST API e discovery: mai da cache
     # ---------------------------------------------------
-    # I documenti sotto /.well-known/ non sono contenuto: sono la mappa
-    # che un client usa per sapere come parlare con questo sito. Li
-    # chiede una volta, in anonimo e senza cookie, quindi finivano dritti
-    # nel ramo generico piu' in basso e restavano in RAM per VARNISH_TTL
-    # (sei ore di default).
+    # Ne' /.well-known/ ne' /wp-json/ sono contenuto: sono il canale con
+    # cui un client esterno - un'app, un server MCP - scopre di cosa e'
+    # capace questo sito e a quali indirizzi parlargli, e poi ci parla.
+    # Sono richieste anonime, senza cookie, spesso in GET: finivano dritte
+    # nel ramo generico piu' in basso e restavano in RAM per VARNISH_TTL.
+    #
+    # E nessuna invalidazione le avrebbe raggiunte: purge_post() conosce
+    # permalink, archivi e feed, non le rotte REST che li espongono. Le
+    # voci restavano fino alla scadenza, su entrambi i livelli.
     #
     # Il guasto reale che ha prodotto questa regola: l'installazione di
     # un server MCP su WordPress pubblica in
@@ -246,20 +250,33 @@ sub vcl_recv {
     # intermittente: la connessione riesce, poi cade e non si riesce piu'
     # a rifarla.
     #
-    # Gli endpoint stessi sono quasi sempre POST o portano Authorization,
-    # quindi passano gia' oltre. Sono elencati lo stesso perche' una GET
-    # anonima ad /wp-json/mcp/... risponde 401, e un 401 memorizzato per
-    # sei ore e' l'ennesima cache che risponde qualcosa che non e' un
-    # errore. Nessuno di questi percorsi ha traffico che valga la RAM.
+    # La regola vale per TUTTA la REST API, non per i soli endpoint
+    # MCP e OAuth come nella prima versione di questo blocco. Elencare
+    # percorsi significava dover indovinare in anticipo come un plugin
+    # installato domani chiamera' le proprie rotte, e sbagliare in
+    # silenzio: l'indice delle rotte (/wp-json/), che e' esattamente il
+    # documento da cui un client impara gli indirizzi, non era in
+    # nessuno di quegli elenchi e restava in cache come una pagina
+    # qualunque.
     #
-    # Entrambe le forme di URL della REST API vanno coperte: il client
-    # usa quella che ha letto nella discovery, non quella che preferiamo
-    # noi.
+    # Il costo e' modesto e va detto: una REST API pubblica e molto
+    # trafficata (un front-end headless) qui non guadagna piu' niente
+    # dalla RAM. Sotto restano nginx per gli asset, OPcache e l'object
+    # cache Redis, che sono i livelli che contano per una risposta
+    # generata da PHP.
+    #
+    # Vale anche per le GET anonime che rispondono 401: un 401 tenuto per
+    # sei ore e' l'ennesima cache che risponde qualcosa che non e' un
+    # errore.
+    #
+    # Entrambe le forme di URL della REST API vanno coperte - "/wp-json/..."
+    # con i permalink leggibili, "?rest_route=/..." senza - perche' il
+    # client usa quella che ha letto nella discovery, non quella che
+    # preferiamo noi.
     if (req.url ~ "^/\.well-known/"
-        || req.url ~ "^/wp-json/mcp(/|\?|$)"
-        || req.url ~ "^/wp-json/[^/]+/[^/]+/oauth(/|\?|$)"
-        || req.url ~ "[?&]rest_route=[^&]*(mcp|oauth)") {
-        set req.http.X-Stack-Bypass = "discovery";
+        || req.url ~ "^/wp-json(/|\?|$)"
+        || req.url ~ "[?&]rest_route=") {
+        set req.http.X-Stack-Bypass = "api";
         return (pass);
     }
 
@@ -508,7 +525,16 @@ sub vcl_backend_response {
         }
         set beresp.ttl = std.duration(beresp.http.X-WP-Varnish-TTL + "s", @DEFAULT_TTL@);
         unset beresp.http.X-WP-Varnish-TTL;
-        set beresp.http.Cache-Control = "public, max-age=0, s-maxage=0, must-revalidate";
+
+        # Cache-Control per il browser la decide il mu-plugin, che e'
+        # l'unico a sapere se questa pagina e' pubblica e che espone la
+        # durata come impostazione. Qui si riempie solo il vuoto: prima
+        # questa riga la riscriveva sempre, quindi l'impostazione della
+        # bacheca non sarebbe mai arrivata al visitatore e il campo
+        # avrebbe mentito senza che niente lo segnalasse.
+        if (!beresp.http.Cache-Control) {
+            set beresp.http.Cache-Control = "public, max-age=0, s-maxage=0, must-revalidate";
+        }
         return (deliver);
     }
 
@@ -553,17 +579,26 @@ sub vcl_backend_response {
     # TTL per tipo di contenuto.
     if (bereq.url ~ "\.(css|js|mjs|ico|gif|jpe?g|png|webp|avif|svg|svgz|woff2?|ttf|otf|eot|map)(\?.*)?$") {
         set beresp.ttl = @STATIC_TTL@;
-        # Gli asset di WordPress sono versionati via query string
-        # (?ver=6.x): un anno di cache browser e' sicuro.
-        set beresp.http.Cache-Control = "public, max-age=31536000, immutable";
+
+        # Gli asset li serve nginx, che dichiara gia' la durata di cache
+        # del browser (STATIC_BROWSER_TTL) nelle due location degli
+        # statici. Qui si copre solo il caso in cui non l'abbia fatto -
+        # un file servito da un'altra location - invece di riscrivere un
+        # valore che vive altrove: due numeri da tenere allineati a mano
+        # sono due numeri che prima o poi divergono.
+        if (!beresp.http.Cache-Control) {
+            set beresp.http.Cache-Control = "public, max-age=31536000, immutable";
+        }
     } else {
         set beresp.ttl = @DEFAULT_TTL@;
 
-        # Il browser non deve tenere l'HTML: la cache condivisa e'
-        # Varnish, ed e' l'unica che sappiamo invalidare. Se la tenesse
-        # anche il browser, un articolo corretto resterebbe vecchio per
-        # ore su quel dispositivo e nessun purge potrebbe raggiungerlo.
-        set beresp.http.Cache-Control = "public, max-age=0, s-maxage=0, must-revalidate";
+        # Rete di sicurezza per quando il mu-plugin non c'e' o e' spento:
+        # il browser non deve tenersi l'HTML, perche' la cache condivisa
+        # e' Varnish ed e' l'unica che sappiamo invalidare. Con il plugin
+        # attivo questa riga non scatta mai: l'header arriva gia' da lui.
+        if (!beresp.http.Cache-Control) {
+            set beresp.http.Cache-Control = "public, max-age=0, s-maxage=0, must-revalidate";
+        }
     }
 
     # Nessun oggetto senza TTL: meglio un minuto di cache che zero.
@@ -603,7 +638,6 @@ sub vcl_deliver {
         set resp.http.X-Cache = "BYPASS";
     } elsif (obj.hits > 0) {
         set resp.http.X-Cache = "HIT";
-        set resp.http.X-Cache-Hits = obj.hits;
     } else {
         set resp.http.X-Cache = "MISS";
     }
