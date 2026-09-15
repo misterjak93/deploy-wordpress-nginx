@@ -136,6 +136,32 @@ Conseguenze da tenere presenti se si tocca lo script:
   sempre che il backend si sta riavviando, e un VCL senza backend non
   compila nemmeno.
 
+### Il nome del backend deve essere unico su dokploy-network
+
+`dokploy-network` è **condivisa da tutti i progetti** sulla stessa
+macchina, e il DNS di Docker risolve un nome su tutte le reti a cui è
+attaccato chi interroga. Varnish sta su entrambe le reti, quindi
+chiedendo `wordpress` riceveva anche i container omonimi degli altri
+stack — altri siti, vivi, che rispondono ma non hanno `/healthz`: tutte
+le probe fallivano e il sito dava 503.
+
+Per questo il servizio `wordpress` ha l'alias **`wp-upstream`** su
+`wordpress-network`, ed è quello che Varnish cerca (`BACKEND_HOST`).
+L'alias esiste solo dentro la rete privata del progetto.
+
+Due copie di questo stack sulla stessa macchina non collidono, perché il
+servizio `wordpress` non è **mai** su `dokploy-network` — ed è anche la
+ragione per cui la cache non è scavalcabile. Le due proprietà si
+sostengono a vicenda: non mettere `wordpress` su `dokploy-network`.
+
+Stessa ambiguità per **adminer**, che sta su `dokploy-network` e
+risolverebbe `mariadb`: da qui l'alias `wp-mariadb`. Il container
+`wordpress` non ha il problema, non essendo su quella rete, e continua a
+usare `DB_HOST=mariadb`.
+
+Regola generale: **ogni nome cercato da un container attaccato a
+`dokploy-network` va reso univoco con un alias.**
+
 ### Ordine delle location in nginx
 
 Le regex vengono valutate nell'ordine in cui compaiono, e un prefisso
@@ -256,9 +282,17 @@ segnalava `mlock() of VSM failed` per via del limite `memlock` a 8 MB.
 
 **503 su tutto il sito, con Varnish vivo.** Gli header lo dicevano:
 `via: ... (Varnish/7.7)` e il corpo della pagina di `vcl_backend_error`,
-quindi non era Traefik ma Varnish senza backend raggiungibili. Terza
-ricaduta della stessa causa di fondo — indirizzi risolti una volta sola —
-da cui la sorveglianza con ricarica a caldo descritta sopra.
+quindi non era Traefik ma Varnish senza backend raggiungibili.
+
+La diagnosi iniziale — indirizzi risolti una volta sola — era **solo metà
+della storia**, e ha prodotto la sorveglianza con ricarica a caldo
+descritta sopra: utile, ma non la causa. La causa l'ha trovata il
+proprietario guardando `docker ps`: cinque container `...-wordpress-1` da
+cinque progetti diversi sulla stessa macchina. Il nome `wordpress` non
+era ambiguo nel tempo, era ambiguo **nello spazio**. Da qui gli alias.
+
+Lezione operativa: prima di dedurre, guardare. Un `docker ps` avrebbe
+risparmiato un giro completo.
 
 **Varnish non partiva, secondo giro:** `Backend host "wordpress":
 resolves to too many addresses` — tre indirizzi sulla rete interna. Da qui

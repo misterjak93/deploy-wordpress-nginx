@@ -37,6 +37,9 @@ services:
       - VARNISH_THREAD_MIN=${VARNISH_THREAD_MIN:-100}
       - VARNISH_THREAD_MAX=${VARNISH_THREAD_MAX:-1000}
       - COMPRESSION_PRIORITY=${COMPRESSION_PRIORITY:-br,zstd,gzip}
+      # NON "wordpress": vedi l'alias sul servizio wordpress qui sotto.
+      - BACKEND_HOST=${BACKEND_HOST:-wp-upstream}
+      - BACKEND_RECHECK_INTERVAL=${BACKEND_RECHECK_INTERVAL:-15}
     volumes:
       - ./varnish/default.vcl.template:/etc/varnish/default.vcl.template:ro
       - ./varnish/varnish-entrypoint.sh:/usr/local/bin/varnish-entrypoint.sh:ro
@@ -178,7 +181,23 @@ services:
       # deve passare da Varnish. Se serve un accesso diretto per
       # diagnosi, aggiungi qui dokploy-network e un dominio dedicato,
       # sapendo che quelle richieste saltano la cache.
-      - wordpress-network
+      wordpress-network:
+        aliases:
+          # Varnish cerca QUESTO nome, non "wordpress".
+          #
+          # dokploy-network e' condivisa da tutti i progetti sulla stessa
+          # macchina, e il DNS di Docker risolve un nome su tutte le reti
+          # a cui e' attaccato chi interroga. Varnish sta su entrambe le
+          # reti, quindi chiedendo "wordpress" riceveva anche i container
+          # omonimi degli altri progetti - che sono altri siti, vivi e
+          # innocenti, ma senza /healthz: tutte le probe fallivano e il
+          # sito rispondeva 503.
+          #
+          # Questo alias esiste solo dentro wordpress-network, che e'
+          # privata del progetto. Due copie di questo stack sulla stessa
+          # macchina non collidono, perche' il servizio wordpress non e'
+          # mai su dokploy-network.
+          - wp-upstream
 
   # -----------------------------------------------------
   # MariaDB
@@ -186,6 +205,10 @@ services:
   mariadb:
     image: mariadb:11.8
     restart: unless-stopped
+    # L'alias serve ad adminer, che stando su dokploy-network rischierebbe
+    # di risolvere "mariadb" al database di un altro progetto. Il
+    # container wordpress non ha il problema: non e' su quella rete, e
+    # continua a usare DB_HOST=mariadb.
     command:
       - "mariadbd"
       - "--innodb-buffer-pool-size=${DB_BUFFER_POOL:-512M}"
@@ -223,7 +246,9 @@ services:
         limits:
           memory: ${DB_MEM_LIMIT:-1024M}
     networks:
-      - wordpress-network
+      wordpress-network:
+        aliases:
+          - wp-mariadb
 
   # -----------------------------------------------------
   # Redis - object cache
@@ -324,7 +349,7 @@ services:
     expose:
       - "8080"
     environment:
-      - ADMINER_DEFAULT_SERVER=mariadb
+      - ADMINER_DEFAULT_SERVER=wp-mariadb
     deploy:
       resources:
         limits:
