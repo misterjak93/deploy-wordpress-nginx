@@ -72,7 +72,7 @@ services:
         # Quali PHP finiscono nell'immagine. Cambiarlo richiede rebuild;
         # scegliere quale delle tre gira e' invece PHP_VERSION, che e'
         # solo runtime.
-        PHP_VERSIONS: ${PHP_VERSIONS:-8.3 8.4 8.5}
+        PHP_VERSIONS: ${PHP_VERSIONS:-8.3,8.4,8.5}
     restart: unless-stopped
     expose:
       - "80"

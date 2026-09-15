@@ -15,17 +15,28 @@ die()  { printf '\033[1;31m[wp]\033[0m %s\n' "$*" >&2; exit 1; }
 # cambiarla e' un riavvio del container, non un rebuild.
 # Si accettano sia "8.3" sia "83".
 PHP_VERSION="${PHP_VERSION:-8.3}"
-case "${PHP_VERSION}" in
-    83|8.3) PHP_VER=8.3 ;;
-    84|8.4) PHP_VER=8.4 ;;
-    85|8.5) PHP_VER=8.5 ;;
-    *)      die "PHP_VERSION='${PHP_VERSION}' non riconosciuta. Valori ammessi: 8.3, 8.4, 8.5." ;;
+
+# Si accettano sia "8.4" sia "84": togliendo i punti e rimettendone uno
+# dopo la prima cifra si normalizzano entrambe, e continuera' a funzionare
+# per una 8.6 o una 9.0 senza toccare niente qui.
+_v="${PHP_VERSION//./}"
+case "${_v}" in
+    [0-9][0-9]|[0-9][0-9][0-9]) PHP_VER="${_v:0:1}.${_v:1}" ;;
+    *) die "PHP_VERSION='${PHP_VERSION}' non e' una versione valida. Esempi: 8.3, 8.4, 8.5 (anche 83, 84, 85)." ;;
 esac
 
+# Versioni realmente presenti nell'immagine, lette dai binari installati
+# invece che da una lista scritta a mano: cosi' l'elenco nell'errore non
+# puo' mentire.
+AVAILABLE=$(ls /usr/sbin/php-fpm* 2>/dev/null | sed 's#.*/php-fpm##' | sort -V | tr '\n' ' ')
+
 if [ ! -x "/usr/sbin/php-fpm${PHP_VER}" ]; then
-    die "PHP ${PHP_VER} non e' in questa immagine (costruita con: ${BUILD_PHP_VERSIONS:-sconosciuto}).
-   Ricostruisci l'immagine con PHP_VERSIONS che includa ${PHP_VER}."
+    die "PHP ${PHP_VER} non e' in questa immagine.
+   Versioni disponibili: ${AVAILABLE:-nessuna}
+   O imposti PHP_VERSION su una di queste (basta riavviare il container),
+   oppure ricostruisci l'immagine con PHP_VERSIONS che includa ${PHP_VER}."
 fi
+
 export PHP_VER
 
 # php e php-fpm generici puntano alla versione scelta: WP-CLI, gli script

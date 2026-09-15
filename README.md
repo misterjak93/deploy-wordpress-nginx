@@ -97,16 +97,34 @@ Si accettano sia `8.4` sia `84`. Una versione non presente nell'immagine ferma l
 ### **Ridurre il peso dell'immagine**
 
 ```
-PHP_VERSIONS=8.3 8.4      # questo sì, richiede rebuild
+PHP_VERSIONS=8.3,8.4      # questo sì, richiede rebuild
 ```
 
 Ogni versione pesa qualche centinaio di MB. Se non ti serve commutare, installane una sola.
+
+Separate da **virgola**: il valore attraversa il `.env`, il parser di Compose e la riscrittura che Dokploy fa del file per iniettare le label Traefik, e uno spazio ha più occasioni di perdersi per strada. Lo spazio funziona comunque.
+
+L'entrypoint non ha una lista di versioni ammesse scritta a mano: accetta qualunque `X.Y` e controlla se il binario esiste davvero nell'immagine, elencando quelli presenti se non lo trova. Aggiungere una versione futura è quindi solo questione di metterla in `PHP_VERSIONS`.
+
+Vale però la pena verificarlo prima di provarci. `deb.sury.org` pubblica già **8.6**, ma al momento senza `php8.6-redis`, che per questo stack è obbligatorio: il build si ferma dicendo esattamente quello.
+
+```
+ERRORE: PHP 8.6 non è installabile, mancano questi pacchetti nel repository: php8.6-redis
+```
 
 ### **Estensioni**
 
 Da `deb.sury.org`, il repository di riferimento (stesso maintainer dei pacchetti php ufficiali Debian): `mysqli`, `curl`, `gd`, `intl`, `mbstring`, `xml`, `zip`, `bcmath`, `soap`, `opcache`, `redis`, più `imagick` e `igbinary` quando disponibili.
 
 Il build **verifica** che le estensioni obbligatorie siano caricate in ogni interprete: se una manca, fallisce il build invece di produrre un'immagine rotta in silenzio. `imagick` e `igbinary` sono trattate come opzionali, perché per una PHP appena uscita possono non essere ancora pubblicate; in quel caso l'entrypoint lo segnala all'avvio.
+
+### **OPcache: un pacchetto che da 8.5 non esiste più**
+
+Fino a PHP 8.4, OPcache arriva dal pacchetto `phpX.Y-opcache`. **Da PHP 8.5 sury lo compila staticamente dentro al binario** e quel pacchetto non viene più pubblicato: chiederlo fa fallire il build con `Unable to locate package php8.5-opcache`.
+
+Per questo il pacchetto sta fra gli opzionali, mentre OPcache resta obbligatorio come *capacità*: lo step di verifica del build interroga l'interprete (`php -v`), che è la prova che conta a prescindere da come il pacchettizzatore abbia deciso di distribuirlo. Se un domani OPcache tornasse pacchetto separato, o sparisse davvero, il build se ne accorge in entrambi i casi.
+
+Se una versione di PHP non è installabile, il build elenca **tutti** i pacchetti mancanti in una volta invece di fermarsi al primo, che è l'unico che `apt` mostrerebbe.
 
 ### **JIT**
 

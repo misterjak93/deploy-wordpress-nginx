@@ -90,7 +90,8 @@ FROM debian:${DEBIAN_CODENAME}-slim
 
 # Versioni PHP da installare. Sovrascrivibile a build time per snellire
 # l'immagine (es. PHP_VERSIONS="8.3") o per aggiungerne una futura.
-ARG PHP_VERSIONS="8.3 8.4 8.5"
+# Separatore virgola o spazio, indifferentemente.
+ARG PHP_VERSIONS="8.3,8.4,8.5"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     BUILD_PHP_VERSIONS="${PHP_VERSIONS}" \
@@ -141,25 +142,48 @@ RUN set -eux; \
     nginx -t -c /etc/nginx/nginx.conf
 
 # -------------------------------------------------------
-# 3. PHP-FPM 8.3 / 8.4 / 8.5
+# 3. PHP-FPM
 # -------------------------------------------------------
-# Le estensioni si dividono in due gruppi:
-#   obbligatorie -> se mancano il build fallisce
-#   opzionali    -> imagick e igbinary possono non essere ancora
-#                   pubblicate per una PHP appena uscita; in quel caso
-#                   l'installazione prosegue e l'entrypoint lo segnala
-#                   all'avvio invece di far morire il deploy.
+# I pacchetti si dividono in due liste, e la differenza non e' cosmetica.
+#
+# OBBLIGATORI: se ne manca uno il build si ferma, elencandoli tutti in un
+# colpo solo invece di morire sul primo (apt si ferma al primo e non dice
+# quanti altri ne mancano).
+#
+# OPZIONALI: pacchetti che possono non esistere per una certa versione di
+# PHP, senza che questo significhi un problema.
+#   - opcache: fino a PHP 8.4 e' un pacchetto a se'; da PHP 8.5 sury lo
+#     compila STATICAMENTE dentro al binario e "php8.5-opcache" non viene
+#     piu' pubblicato. Chiederlo faceva fallire il build con
+#     "Unable to locate package". Che OPcache ci sia davvero non e'
+#     comunque lasciato al caso: lo verifica lo step 4 interrogando
+#     l'interprete, che e' la prova che conta a prescindere da come il
+#     pacchettizzatore abbia deciso di distribuirlo.
+#   - imagick, igbinary, zstd: per una PHP appena uscita possono non
+#     essere ancora ricompilati.
 RUN set -eux; \
+    REQUIRED="fpm cli common mysql curl gd intl mbstring xml zip bcmath soap redis"; \
+    OPTIONAL="opcache imagick igbinary zstd"; \
     apt-get update; \
-    for v in ${PHP_VERSIONS}; do \
-        apt-get install -y --no-install-recommends \
-            "php${v}-fpm" "php${v}-cli" "php${v}-common" "php${v}-opcache" \
-            "php${v}-mysql" "php${v}-curl" "php${v}-gd" "php${v}-intl" \
-            "php${v}-mbstring" "php${v}-xml" "php${v}-zip" "php${v}-bcmath" \
-            "php${v}-soap" "php${v}-redis"; \
-        for opt in "php${v}-imagick" "php${v}-igbinary" "php${v}-zstd"; do \
-            apt-get install -y --no-install-recommends "${opt}" \
-                || echo "AVVISO: ${opt} non disponibile, si prosegue senza."; \
+    for v in $(echo "${PHP_VERSIONS}" | tr ',' ' '); do \
+        missing=""; \
+        for p in ${REQUIRED}; do \
+            apt-cache show "php${v}-${p}" > /dev/null 2>&1 || missing="${missing} php${v}-${p}"; \
+        done; \
+        if [ -n "${missing}" ]; then \
+            echo "ERRORE: PHP ${v} non e' installabile, mancano questi pacchetti nel repository:${missing}"; \
+            echo "       Verifica che la versione esista su deb.sury.org per questa release Debian."; \
+            exit 1; \
+        fi; \
+        pkgs=""; \
+        for p in ${REQUIRED}; do pkgs="${pkgs} php${v}-${p}"; done; \
+        apt-get install -y --no-install-recommends ${pkgs}; \
+        for p in ${OPTIONAL}; do \
+            if apt-cache show "php${v}-${p}" > /dev/null 2>&1; then \
+                apt-get install -y --no-install-recommends "php${v}-${p}"; \
+            else \
+                echo "NOTA: php${v}-${p} non e' pubblicato per questa versione, si prosegue."; \
+            fi; \
         done; \
         rm -f "/etc/php/${v}/fpm/pool.d/www.conf"; \
     done; \
@@ -174,12 +198,12 @@ RUN set -eux; \
 # -------------------------------------------------------
 # Meglio un build rosso di un'immagine che parte e sbaglia in silenzio.
 RUN set -eux; \
-    for v in ${PHP_VERSIONS}; do \
+    for v in $(echo "${PHP_VERSIONS}" | tr ',' ' '); do \
         bin="/usr/bin/php${v}"; \
         for ext in redis mysqli curl gd intl mbstring xml zip bcmath; do \
             "$bin" -m | grep -qix "$ext" || { echo "ERRORE: estensione $ext mancante in php${v}"; exit 1; }; \
         done; \
-        "$bin" -v | grep -q "OPcache" || { echo "ERRORE: OPcache non attivo in php${v}"; exit 1; }; \
+        "$bin" -v | grep -q "OPcache" || { echo "ERRORE: OPcache non disponibile in php${v} (ne' come pacchetto ne' compilato nel binario)"; exit 1; }; \
         if "$bin" -m | grep -qix imagick; then \
             "$bin" -r 'echo "php", PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION, " | imagick ", phpversion("imagick"), " | ", Imagick::getVersion()["versionString"], PHP_EOL;'; \
         else \
