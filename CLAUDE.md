@@ -203,6 +203,43 @@ Per gli endpoint che rispondono con `return`, il filtro va fatto con un
 `if` sulla mappa `$client_interno`, che sta nella stessa fase e lo
 precede.
 
+### `open_file_cache` va spento dove vive la cache FastCGI
+
+`open_file_cache` è attivo a livello `http` per gli asset statici, dove
+rende parecchio. Ma tiene aperti i **descrittori** dei file: quando il
+plugin cancella una voce di cache, il file sparisce dalla directory e il
+suo inode resta vivo finché nginx tiene il descrittore. Per un minuto
+intero nginx continua a servire il contenuto vecchio, rispondendo `HIT`
+e senza mai interpellare PHP.
+
+È il difetto peggiore possibile in una cache, perché è **silenzioso**: la
+bacheca dice che la cache è stata svuotata e il sito mostra ancora la
+versione precedente.
+
+`fastcgi-cache-use.conf.template` contiene quindi `open_file_cache off;`.
+Vale solo per le location con cache di pagina; gli statici continuano a
+goderne. Trovato solo perché il test contava le esecuzioni di PHP invece
+di fidarsi dell'header.
+
+### `fastcgi_cache_use_stale` non accetta `http_502` né `http_504`
+
+I valori ammessi sono `error`, `timeout`, `invalid_header`, `updating`,
+`http_500`, `http_503`, `http_403`, `http_404`, `http_429`. Un gateway
+morto ricade sotto `error`, un backend lento sotto `timeout`. Metterne
+uno non valido fa **fallire l'avvio** di nginx.
+
+### La chiave di cache è duplicata in due posti
+
+`fastcgi_cache_key` in `fastcgi-cache.conf.template` e il calcolo in
+`Stack_Cache::nginx_path_for_url()` devono produrre la stessa identica
+stringa (`GET|host|request_uri`), e la struttura delle directory deve
+seguire `levels=1:2`: ultimo carattere dell'md5, poi i due precedenti.
+
+Se divergono, l'invalidazione smette di funzionare **senza errori**: il
+plugin cancella file che non esistono e il sito serve contenuto vecchio.
+Verificato confrontando il percorso calcolato dal plugin con il file
+davvero scritto da nginx.
+
 ### `add_header` non si eredita
 
 Appena una location ne dichiara uno, tutti quelli del livello superiore

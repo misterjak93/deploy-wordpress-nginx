@@ -160,6 +160,17 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
 
+      # --- Cache di pagina su disco (secondo livello) ---
+      - FASTCGI_CACHE_ENABLED=${FASTCGI_CACHE_ENABLED:-1}
+      - FASTCGI_CACHE_DIR=${FASTCGI_CACHE_DIR:-/var/cache/nginx/wordpress}
+      - FASTCGI_CACHE_MAX_SIZE=${FASTCGI_CACHE_MAX_SIZE:-2g}
+      - FASTCGI_CACHE_ZONE_SIZE=${FASTCGI_CACHE_ZONE_SIZE:-64m}
+      - FASTCGI_CACHE_INACTIVE=${FASTCGI_CACHE_INACTIVE:-60d}
+      - FASTCGI_CACHE_TTL=${FASTCGI_CACHE_TTL:-30d}
+      - INSTALL_MU_PLUGINS=${INSTALL_MU_PLUGINS:-1}
+      # Letto dal mu-plugin per invalidare Varnish dall'interno.
+      - VARNISH_HOST=varnish
+
       # --- Manutenzione ---
       - WP_AUTO_INSTALL=${WP_AUTO_INSTALL:-1}
       - WP_CRON_ENABLED=${WP_CRON_ENABLED:-true}
@@ -167,6 +178,13 @@ services:
       - FIX_PERMISSIONS=${FIX_PERMISSIONS:-0}
     volumes:
       - wordpress_data:/var/www/wordpress
+      # La cache su disco sta su un volume, non nel livello scrivibile del
+      # container: e' il livello "durevole" dei due, e perderla ad ogni
+      # ricreazione vanificherebbe la ragione per cui esiste.
+      # Il volume nasce root:root, ma qui l'entrypoint gira da root e puo'
+      # correggerne il proprietario all'avvio - a differenza di Varnish,
+      # che gira come utente non privilegiato.
+      - nginx_cache:/var/cache/nginx
     depends_on:
       mariadb:
         condition: service_healthy
@@ -360,6 +378,7 @@ services:
 
 volumes:
   wordpress_data:
+  nginx_cache:
   mariadb_data:
   redis_data:
   filebrowser_data:

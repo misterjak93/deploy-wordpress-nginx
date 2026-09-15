@@ -296,6 +296,30 @@ sub vcl_backend_response {
     set beresp.grace = @GRACE@;
     set beresp.keep  = 24h;
 
+    # -----------------------------------------------
+    # TTL deciso dal mu-plugin
+    # -----------------------------------------------
+    # Il plugin conosce il contenuto - se la pagina e' personale, se e'
+    # un articolo appena pubblicato, che impostazioni ha dato l'utente -
+    # mentre qui si vedono solo header. Quando si esprime, comanda lui.
+    #
+    # "0" significa: non mettere in cache. Si usa uncacheable invece di
+    # un ttl zero perche' altrimenti ogni richiesta a quella pagina
+    # tornerebbe al backend in parallelo; cosi' Varnish ricorda per due
+    # minuti che non e' cacheabile e non ci riprova ad ogni colpo.
+    if (beresp.http.X-WP-Varnish-TTL) {
+        if (beresp.http.X-WP-Varnish-TTL == "0") {
+            set beresp.uncacheable = true;
+            set beresp.ttl = 120s;
+            unset beresp.http.X-WP-Varnish-TTL;
+            return (deliver);
+        }
+        set beresp.ttl = std.duration(beresp.http.X-WP-Varnish-TTL + "s", @DEFAULT_TTL@);
+        unset beresp.http.X-WP-Varnish-TTL;
+        set beresp.http.Cache-Control = "public, max-age=0, s-maxage=0, must-revalidate";
+        return (deliver);
+    }
+
     # Errori del backend: TTL cortissimo, cosi' un 500 momentaneo non
     # resta appeso per ore, ma un picco di richieste sulla stessa pagina
     # rotta non martella comunque PHP.
@@ -362,6 +386,8 @@ sub vcl_deliver {
     # Header di servizio: non devono uscire verso il visitatore.
     unset resp.http.X-Cache-Host;
     unset resp.http.X-Cache-Url;
+    # Istruzione destinata a nginx, non al browser.
+    unset resp.http.X-Accel-Expires;
     unset resp.http.X-Powered-By;
     unset resp.http.Server;
     unset resp.http.X-Pingback;

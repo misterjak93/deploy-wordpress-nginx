@@ -1,0 +1,58 @@
+# =======================================================
+# Uso della cache FastCGI dentro una location PHP
+# =======================================================
+# Incluso solo nelle location che servono pagine pubbliche. Mai in
+# wp-login, xmlrpc, admin-ajax o negli endpoint diagnostici.
+
+fastcgi_cache               wpcache;
+
+# TTL lungo di proposito: questa cache non scade, si invalida. Il
+# mu-plugin cancella le voci quando il contenuto cambia davvero, quindi
+# far scadere le pagine a tempo significherebbe solo rigenerarle per
+# niente. Puo' essere sovrascritto per singola risposta dal plugin, che
+# manda "X-Accel-Expires" (nginx lo onora nativamente e vince su tutto).
+fastcgi_cache_valid         200 301 302 ${FASTCGI_CACHE_TTL};
+fastcgi_cache_valid         404 1m;
+
+fastcgi_cache_bypass        $cache_skip;
+fastcgi_no_cache            $cache_skip;
+
+# Serve la copia vecchia mentre quella nuova viene rigenerata in
+# background: nessun visitatore aspetta la rigenerazione, e se PHP cade
+# il sito resta navigabile. E' l'equivalente del grace di Varnish.
+# Attenzione ai valori ammessi: http_502 e http_504 NON esistono per
+# questa direttiva e fanno fallire l'avvio di nginx. Un gateway morto
+# ricade sotto "error" e un backend lento sotto "timeout", che ci sono.
+fastcgi_cache_use_stale     updating error timeout invalid_header
+                            http_500 http_503 http_429;
+fastcgi_cache_background_update on;
+
+# Con lock, di dieci richieste simultanee alla stessa pagina scaduta una
+# sola va a PHP e le altre aspettano il risultato. Senza, arriverebbero
+# tutte e dieci: e' il "cache stampede", il modo classico in cui un sito
+# cade proprio quando diventa popolare.
+fastcgi_cache_lock          on;
+fastcgi_cache_lock_timeout  10s;
+
+# Volutamente NON si ignora Set-Cookie ne' Cache-Control: se WordPress
+# marca una risposta come privata, va rispettata. Il plugin usa
+# X-Accel-Expires per dire esplicitamente cosa e' cacheabile e per
+# quanto, quindi non serve forzare la mano a nginx.
+add_header X-Nginx-Cache    $upstream_cache_status always;
+
+# Senza questa riga l'invalidazione non funziona, e non se ne accorge
+# nessuno.
+#
+# open_file_cache (attivo a livello http per gli asset statici, dove
+# rende parecchio) tiene aperti i descrittori dei file. Quando il plugin
+# cancella una voce di cache, il file sparisce dalla directory ma il suo
+# inode resta vivo finche' nginx tiene il descrittore aperto: per un
+# minuto intero nginx continua a servire il contenuto vecchio,
+# rispondendo "HIT" e senza mai interpellare PHP.
+#
+# E' il difetto peggiore possibile in una cache: silenzioso. Pubblichi un
+# articolo, la bacheca dice che la cache e' stata svuotata, e il sito
+# mostra ancora la versione precedente.
+#
+# Qui si spegne solo dove serve. Gli statici continuano a goderne.
+open_file_cache             off;

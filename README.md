@@ -273,6 +273,76 @@ Se PHP comprimesse in proprio, nginx riceverebbe un corpo già codificato e perd
 
 ---
 
+## **🧊 6-bis. Cache a due livelli**
+
+```
+Traefik ─▶ Varnish ─▶ nginx ─▶ PHP-FPM
+           (RAM)      (SSD)
+           TTL 1h     TTL 30gg
+```
+
+I due livelli non sono ridondanti: hanno difetti opposti.
+
+| | Varnish | nginx FastCGI |
+| --- | --- | --- |
+| Dove | RAM | SSD |
+| Capienza | centinaia di MB | gigabyte |
+| Sopravvive al riavvio | **no** | **sì** |
+| Velocità (misurata) | 75.000 req/s | 12.600 req/s |
+
+Varnish è cinque volte più veloce, ma quando il suo container riparte la
+cache è vuota e tutto il traffico piomba su PHP nello stesso istante.
+nginx assorbe quei MISS: PHP viene interpellato solo quando la pagina
+manca in **entrambi**.
+
+Ogni risposta dichiara l'esito dei due livelli:
+
+```bash
+curl -sI https://tuosito.com/ | grep -i 'x-cache\|x-nginx-cache\|x-wp-cache-reason'
+```
+
+`X-Cache` è Varnish, `X-Nginx-Cache` il livello su disco, e
+`X-WP-Cache-Reason` dice **perché** una pagina non è stata memorizzata —
+la domanda più frequente quando una cache "non prende".
+
+### **Il plugin Stack Cache**
+
+Installato come must-use plugin dall'entrypoint: fa parte
+dell'infrastruttura e non è disattivabile per errore dalla bacheca.
+
+I due livelli sono ciechi — vedono header e cookie, non sanno se una
+pagina è un articolo appena pubblicato o il carrello di qualcuno.
+WordPress lo sa. Il plugin traduce quella conoscenza in istruzioni che i
+due livelli capiscono nativamente:
+
+| Destinatario | Header | Effetto |
+| --- | --- | --- |
+| nginx | `X-Accel-Expires` | supportato nativamente, vince su `Cache-Control` |
+| Varnish | `X-WP-Varnish-TTL` | letto in `vcl_backend_response` |
+
+Nessuno dei due esce mai verso il visitatore.
+
+Dalla voce **Cache** in bacheca: stato dei quattro livelli, svuotamento
+singolo o totale, invalidazione di un indirizzo, TTL separati per i due
+livelli, automazioni sugli eventi di WordPress e preload.
+
+### **Utenti loggati**
+
+Tre strati indipendenti concordano nel non servire mai una pagina
+personale a un estraneo: il VCL di Varnish, le mappe `$cache_skip` di
+nginx e il plugin, che manda TTL zero. Basta un cookie di sessione, un
+header `Authorization` o un nonce REST.
+
+I cookie di analytics (`_ga`, `_fbp`, consensi) sono invece **ignorati**:
+sono la ragione numero uno per cui una cache di pagina "non prende mai".
+
+### **Preload**
+
+Dopo un'invalidazione le pagine vengono richieste in sottofondo, così il
+primo visitatore trova la cache già piena. Gli indirizzi arrivano dalla
+sitemap di WordPress, e le richieste vanno a `127.0.0.1` — cioè a nginx
+nello stesso container: non dipendono da DNS, Traefik o certificato.
+
 ## **🖼 7. Immagini: AVIF e WebP**
 
 nginx serve automaticamente la variante moderna quando il browser la accetta, senza plugin lato PHP nel percorso della richiesta:
