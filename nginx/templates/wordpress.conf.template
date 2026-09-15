@@ -38,11 +38,21 @@ server {
     # container e il depends_on di Varnish.
     location = /healthz {
         access_log      off;
+
+        # "allow/deny" da solo NON basta qui: agisce nella fase di
+        # access, che viene dopo quella di rewrite, e "return" risponde
+        # gia' in fase di rewrite. Il risultato era un /healthz
+        # raggiungibile da Internet. Il controllo va quindi fatto con un
+        # "if", che sta nella stessa fase del return e lo precede.
+        if ($client_interno = 0) {
+            return 403;
+        }
         allow           127.0.0.0/8;
         allow           10.0.0.0/8;
         allow           172.16.0.0/12;
         allow           192.168.0.0/16;
         deny            all;
+
         add_header      Content-Type text/plain always;
         return          200 "ok\n";
     }
