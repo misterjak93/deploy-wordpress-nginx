@@ -67,7 +67,6 @@ server {
         deny            all;
         access_log      off;
         include         /etc/nginx/snippets/fastcgi-php.conf;
-        fastcgi_param   SCRIPT_FILENAME /healthz-php;
         fastcgi_pass    unix:/run/php/php-fpm.sock;
     }
 
@@ -127,6 +126,30 @@ server {
     }
 
     # -----------------------------------------------
+    # XML e TXT: possono non essere file
+    # -----------------------------------------------
+    # Stanno FUORI dalla location degli asset qui sotto, e deve restare
+    # cosi'. Li' la regola e' "try_files $uri =404", giusta per un .css che
+    # o c'e' o non c'e'; ma xml e txt sono anche risorse che WordPress
+    # GENERA e che sul disco non esistono: le sitemap del core
+    # (/wp-sitemap.xml e figlie, attive per default dalla 5.5), quelle dei
+    # plugin SEO, un ads.txt gestito da plugin. Finendo nella regex degli
+    # statici rispondevano tutte 404.
+    #
+    # L'effetto peggiore era interno: il preload del mu-plugin chiede
+    # /wp-sitemap.xml per costruire la coda, riceveva 404 e ripiegava in
+    # silenzio sugli ultimi 100 contenuti. Il "preload dalla sitemap" non
+    # aveva mai letto una sitemap.
+    #
+    # Il file vero continua a essere servito da nginx; solo il miss arriva
+    # a WordPress.
+    location ~* \.(?:xml|txt)$ {
+        access_log      off;
+        include         /etc/nginx/snippets/security-headers.conf;
+        try_files       $uri /index.php?$args;
+    }
+
+    # -----------------------------------------------
     # Immagini: negoziazione AVIF/WebP + cache lunga
     # -----------------------------------------------
     # I plugin di conversione (CompressX, WebP Express, ...) scrivono le
@@ -138,9 +161,14 @@ server {
     # "Vary: Accept" e' obbligatorio: senza, Varnish (e qualunque CDN a
     # monte) servirebbe l'AVIF anche a chi non lo sa leggere.
     location ~* ^/wp-content/(?<img_path>.+)\.(?<img_ext>jpe?g|png)$ {
+        # add_header non si eredita: dichiarandone di propri, questa
+        # location perdeva tutti quelli del server block (HSTS,
+        # Referrer-Policy, Permissions-Policy, le due Cross-Origin-*).
+        # E' la regola scritta in testa allo snippet, che proprio le due
+        # location degli asset non rispettavano.
+        include         /etc/nginx/snippets/security-headers.conf;
         add_header      Vary Accept;
         add_header      Cache-Control "public, max-age=31536000, immutable";
-        add_header      X-Content-Type-Options "nosniff" always;
         access_log      off;
         try_files       /wp-content/${CONVERTED_DIR}/$img_path.$img_ext$img_avif
                         /wp-content/${CONVERTED_DIR}/$img_path.$img_ext$img_webp
@@ -151,14 +179,20 @@ server {
     # -----------------------------------------------
     # Asset statici
     # -----------------------------------------------
-    location ~* \.(?:css|js|mjs|json|map|ico|gif|webp|avif|svg|svgz|bmp|tiff?|woff|woff2|ttf|otf|eot|mp4|webm|ogv|mp3|ogg|wav|flac|pdf|txt|xml|zip|gz)$ {
+    # xml e txt NON sono in questa lista: vedi la location dedicata qui
+    # sopra. Qui dentro finirebbero sotto "try_files $uri =404" e le
+    # sitemap generate da WordPress sparirebbero.
+    location ~* \.(?:css|js|mjs|json|map|ico|gif|webp|avif|svg|svgz|bmp|tiff?|woff|woff2|ttf|otf|eot|mp4|webm|ogv|mp3|ogg|wav|flac|pdf|zip|gz)$ {
         access_log      off;
         log_not_found   off;
+        # Stessa ragione della location delle immagini: dichiarando
+        # add_header propri, senza questo include spariscono quelli del
+        # server block.
+        include         /etc/nginx/snippets/security-headers.conf;
         # Niente "expires": emetterebbe un secondo Cache-Control accanto a
         # questo, e i due valori non coinciderebbero (expires non sa dire
         # immutable). Un solo header, esplicito.
         add_header      Cache-Control "public, max-age=31536000, immutable";
-        add_header      X-Content-Type-Options "nosniff" always;
         add_header      Access-Control-Allow-Origin "*";
         tcp_nodelay     off;
         try_files       $uri =404;

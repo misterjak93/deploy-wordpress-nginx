@@ -219,7 +219,16 @@ mkdir -p /etc/nginx/conf.d
 # includerebbero un file inesistente e nginx non partirebbe.
 if [ "${FASTCGI_CACHE_ENABLED}" = "1" ]; then
     mkdir -p "${FASTCGI_CACHE_DIR}"
-    chown -R www-data:www-data "$(dirname "${FASTCGI_CACHE_DIR}")" 2>/dev/null || true
+    # La passata ricorsiva solo quando serve davvero, cioe' la prima volta,
+    # quando il volume nasce di root. Farla sempre significa toccare ogni
+    # inode della cache ad ogni avvio del container: con
+    # FASTCGI_CACHE_MAX_SIZE a 2g sono decine di migliaia di file, e il
+    # tempo si paga prima ancora che nginx venga validato.
+    # E' lo stesso schema gia' usato per WP_ROOT piu' sotto.
+    if [ "$(stat -c '%U' "${FASTCGI_CACHE_DIR}" 2>/dev/null)" != "www-data" ]; then
+        log "Correzione proprietario della cache su disco..."
+        chown -R www-data:www-data "$(dirname "${FASTCGI_CACHE_DIR}")" 2>/dev/null || true
+    fi
     envsubst "${NGINX_VARS}" < /etc/nginx/templates/fastcgi-cache.conf.template \
         > /etc/nginx/snippets/fastcgi-cache.conf
     envsubst "${NGINX_VARS}" < /etc/nginx/templates/fastcgi-cache-use.conf.template \
@@ -282,11 +291,48 @@ for enc in $(echo "${COMPRESSION_PRIORITY:-br,zstd,gzip}" | tr ',' ' '); do
 done
 
 if [ "${FIREWALL_ENABLED}" = "1" ]; then
+    # Il cookie di bypass spegne TUTTO il firewall, quindi due cose devono
+    # essere vere prima di scriverlo nella configurazione.
+    #
+    # 1. Il valore di esempio non deve essere funzionante. E' pubblicato in
+    #    tre punti di questo repository (.env.example, docker-compose.yml e
+    #    qui sopra come default): lasciarlo attivo significa distribuire una
+    #    chiave che chiunque conosca il progetto puo' usare. Un avviso nei
+    #    log non basta - si legge una volta, il default resta.
+    #
+    # 2. Il valore finisce GREZZO dentro a una PCRE
+    #    ("~*${FIREWALL_BYPASS_COOKIE}" in firewall-8g.conf.template).
+    #    Una parentesi tonda, che un generatore di password produce senza
+    #    pensarci, rende la mappa non compilabile e nginx non parte: sito
+    #    giu' al deploy, con un errore che non nomina il .env. Un punto o
+    #    un asterisco, al contrario, allargano il bypass a quasi qualunque
+    #    cookie.
+    #
+    # In entrambi i casi si fallisce CHIUSI: il bypass si disattiva, il
+    # firewall resta in piedi.
+    case "${FIREWALL_BYPASS_COOKIE}" in
+        ""|"wpfw-bypass-CAMBIAMI")
+            warn "FIREWALL_BYPASS_COOKIE non impostato (o ancora il valore di esempio): bypass del firewall DISATTIVATO."
+            warn "         Mettine uno tuo nel .env per poterlo usare."
+            FIREWALL_BYPASS_COOKIE=""
+            ;;
+        *[!A-Za-z0-9_-]*)
+            warn "FIREWALL_BYPASS_COOKIE contiene caratteri non ammessi: bypass del firewall DISATTIVATO."
+            warn "         Sono ammessi solo lettere, numeri, '-' e '_': il valore finisce dentro a"
+            warn "         un'espressione regolare di nginx, e un carattere come '(' impedirebbe l'avvio."
+            FIREWALL_BYPASS_COOKIE=""
+            ;;
+    esac
+
+    if [ -z "${FIREWALL_BYPASS_COOKIE}" ]; then
+        # Il template dichiara sempre la mappa, quindi non si puo' toglierla:
+        # le si da' un valore che nessun client puo' indovinare.
+        FIREWALL_BYPASS_COOKIE="bypass-disattivato-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    fi
+    export FIREWALL_BYPASS_COOKIE
+
     envsubst "${NGINX_VARS}" < /etc/nginx/templates/firewall-8g.conf.template \
         > /etc/nginx/snippets/firewall-8g.conf
-    if [ "${FIREWALL_BYPASS_COOKIE}" = "wpfw-bypass-CAMBIAMI" ]; then
-        warn "FIREWALL_BYPASS_COOKIE e' ancora il valore di esempio: cambialo nel .env."
-    fi
 else
     # Il file deve esistere comunque: nginx.conf lo include sempre.
     # $fw_block a 0 costante fa saltare ogni controllo.

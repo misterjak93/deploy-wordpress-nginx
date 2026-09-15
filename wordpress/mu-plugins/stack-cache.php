@@ -179,7 +179,13 @@ final class Stack_Cache {
 				|| str_starts_with( $name, 'woocommerce_items_in_cart' )
 				|| str_starts_with( $name, 'wp_woocommerce_session_' )
 				|| str_starts_with( $name, 'edd_items_in_cart' ) ) {
-				return $no( 'cookie di sessione: ' . $name );
+				// Il nome del cookie lo sceglie chi chiama, e questa stringa
+				// esce in un header di risposta (X-WP-Cache-Reason). PHP
+				// rifiuta CR e LF in header(), quindi non e' header
+				// injection, ma far tornare indietro testo arbitrario da un
+				// endpoint diagnostico e' superficie regalata: si nomina la
+				// famiglia, non il cookie.
+				return $no( 'cookie di sessione' );
 			}
 		}
 
@@ -276,7 +282,20 @@ final class Stack_Cache {
 			'http://' . $this->varnish_host() . $path,
 			array(
 				'method'    => 'PURGE',
-				'headers'   => array( 'Host' => $this->site_host() ),
+				'headers'   => array(
+					'Host' => $this->site_host(),
+					// Obbligatorio, e non e' un dettaglio: vcl_hash include
+					// X-Forwarded-Proto quando c'e'. Le richieste dei
+					// visitatori passano da Traefik e ce l'hanno sempre,
+					// quindi gli oggetti in cache sono indicizzati su
+					// url+host+"https". Senza questo header il PURGE
+					// calcolava un hash diverso, non trovava nulla, e
+					// Varnish rispondeva 200 lo stesso: l'invalidazione
+					// della singola pagina non funzionava mai, in silenzio.
+					// Il VCL ora mette anche un default, ma mandarlo da qui
+					// rende la cosa leggibile da questo lato.
+					'X-Forwarded-Proto' => 'https',
+				),
 				'timeout'   => 5,
 				'sslverify' => false,
 			)
@@ -293,6 +312,11 @@ final class Stack_Cache {
 				'headers'   => array(
 					'Host'              => $this->site_host(),
 					'X-Ban-Expression'  => '.',
+					// Il BAN confronta gli header dell'oggetto, non l'hash,
+					// quindi qui non sarebbe indispensabile. Si manda per
+					// coerenza con il PURGE: l'unica forma che il VCL vede
+					// arrivare e' quella di una richiesta passata dal bordo.
+					'X-Forwarded-Proto' => 'https',
 				),
 				'timeout'   => 5,
 				'sslverify' => false,
@@ -336,7 +360,7 @@ final class Stack_Cache {
 	 * peggiore, perche' il sito continua a servire contenuto vecchio
 	 * senza alcun errore.
 	 */
-	public function nginx_path_for_url( string $url ): string {
+	public function nginx_path_for_url( string $url, string $method = 'GET' ): string {
 		$parts = wp_parse_url( $url );
 		$host  = strtolower( (string) ( $parts['host'] ?? $this->site_host() ) );
 		$uri   = (string) ( $parts['path'] ?? '/' );
@@ -344,17 +368,41 @@ final class Stack_Cache {
 			$uri .= '?' . $parts['query'];
 		}
 
-		$md5 = md5( 'GET|' . $host . '|' . $uri );
+		$md5 = md5( strtoupper( $method ) . '|' . $host . '|' . $uri );
 
 		return $this->nginx_dir() . '/' . substr( $md5, -1 ) . '/' . substr( $md5, -3, 2 ) . '/' . $md5;
 	}
 
+	/**
+	 * Tutti i percorsi che nginx puo' aver scritto per lo stesso URL.
+	 *
+	 * La chiave comincia con $request_method, quindi una HEAD e una GET
+	 * sulla stessa pagina sono due voci distinte. Cancellare solo la GET
+	 * lasciava in giro la variante HEAD - creata da monitor esterni,
+	 * anteprime di link, crawler - che nessuna invalidazione toccava piu'
+	 * fino a inactive=60d.
+	 *
+	 * Il metodo resta nella chiave apposta: senza, una HEAD in MISS
+	 * memorizzerebbe una risposta senza corpo che verrebbe poi servita a
+	 * una GET.
+	 *
+	 * @return string[]
+	 */
+	public function nginx_paths_for_url( string $url ): array {
+		return array(
+			$this->nginx_path_for_url( $url, 'GET' ),
+			$this->nginx_path_for_url( $url, 'HEAD' ),
+		);
+	}
+
 	public function purge_nginx_url( string $url ): bool {
-		$file = $this->nginx_path_for_url( $url );
-		if ( is_file( $file ) ) {
-			return @unlink( $file );
+		$ok = true;
+		foreach ( $this->nginx_paths_for_url( $url ) as $file ) {
+			if ( is_file( $file ) && ! @unlink( $file ) ) {
+				$ok = false;
+			}
 		}
-		return true; // gia' assente: l'obiettivo e' raggiunto
+		return $ok; // gia' assente conta come raggiunto
 	}
 
 	/** @return int numero di file rimossi */
@@ -825,6 +873,18 @@ final class Stack_Cache {
 						'Host'            => $host,
 						'X-Stack-Preload' => '1',
 						'Accept-Encoding' => 'gzip',
+						// Senza questo la mappa $fcgi_https resta vuota, PHP
+						// riceve HTTPS vuoto e is_ssl() risponde falso. Non
+						// e' cosmetico: set_url_scheme() risolve gli schemi
+						// 'admin', 'login' e 'rest' proprio su is_ssl(),
+						// quindi admin_url(), wp_login_url() e get_rest_url()
+						// uscivano in http://. E la chiave della cache su
+						// disco non contiene lo schema, quindi quella pagina
+						// finiva nella stessa voce che poi legge il
+						// visitatore in HTTPS, con la radice REST in chiaro
+						// dentro all'HTML - cioe' bloccata dal browser come
+						// contenuto misto.
+						'X-Forwarded-Proto' => 'https',
 					),
 				)
 			);

@@ -217,9 +217,24 @@ RUN set -eux; \
 # Il wrapper degrada a www-data quando lo si lancia da root: WP-CLI si
 # rifiuta di girare come root e, soprattutto, i file creati da un comando
 # lanciato come root resterebbero non scrivibili da PHP.
+# Il phar viene verificato prima di renderlo eseguibile: e' codice di terzi
+# che gira con i permessi di www-data su tutta la docroot, e "l'ho scaricato
+# in HTTPS" dice solo da quale host arriva, non che sia quello atteso.
+# wp-cli pubblica lo sha512 accanto al file, quindi costa due righe.
 RUN set -eux; \
     curl -fsSL -o /usr/local/bin/wp-cli.phar \
         https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar; \
+    curl -fsSL -o /tmp/wp-cli.phar.sha512 \
+        https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar.sha512; \
+    atteso="$(awk '{print $1}' /tmp/wp-cli.phar.sha512)"; \
+    ottenuto="$(sha512sum /usr/local/bin/wp-cli.phar | awk '{print $1}')"; \
+    if [ -z "${atteso}" ] || [ "${atteso}" != "${ottenuto}" ]; then \
+        echo "ERRORE: wp-cli.phar non corrisponde allo sha512 pubblicato."; \
+        echo "        atteso:   ${atteso}"; \
+        echo "        ottenuto: ${ottenuto}"; \
+        exit 1; \
+    fi; \
+    rm -f /tmp/wp-cli.phar.sha512; \
     chmod +x /usr/local/bin/wp-cli.phar
 
 # -------------------------------------------------------
