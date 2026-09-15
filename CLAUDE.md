@@ -99,9 +99,20 @@ almeno due.
 
 ### Varnish risolve il backend a tempo di compilazione
 
-Non ad ogni richiesta. Se il container `wordpress` viene ricreato e
-cambia IP, Varnish punta al vecchio finché non riparte. Per questo il
-wrapper aspetta che il nome sia risolvibile prima di compilare.
+Non ad ogni richiesta, **e accetta un solo IPv4 per backend**. Se il nome
+`wordpress` ne restituisce più di uno — più repliche, o container rimasti
+attaccati alla rete da un deploy precedente — la compilazione fallisce con
+`resolves to too many addresses` e il container non parte affatto.
+
+Per questo i backend non sono scritti nel template: il wrapper enumera
+tutti gli indirizzi e ne genera uno per ciascuno, dietro a un director
+`round_robin`. La probe ha `.initial = 0`, quindi ogni backend parte
+**malato** e deve guadagnarsi il traffico rispondendo: è ciò che rende
+innocuo un indirizzo rimasto da un deploy vecchio, invece di mandargli
+richieste finché la probe non se ne accorge.
+
+Non tornare a un `backend default` statico con il nome DNS: rompe appena
+compare un secondo indirizzo.
 
 ### Ordine delle location in nginx
 
@@ -200,6 +211,12 @@ Dokploy).
 **Varnish non partiva:** `cannot create /etc/varnish/default.vcl:
 Permission denied`. Vedi *Varnish gira come utente non-root* qui sopra.
 Nella stessa occasione è emerso che `varnishd -C` scrive su stderr.
+
+**Varnish non partiva, secondo giro:** `Backend host "wordpress":
+resolves to too many addresses` — tre indirizzi sulla rete interna. Da qui
+i backend generati più il director descritti sopra. Il messaggio d'errore
+era leggibile solo grazie al fix precedente sullo stderr: prima sarebbe
+stato sepolto in 110 KB di sorgente C.
 
 ---
 

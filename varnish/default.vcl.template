@@ -1,6 +1,7 @@
 vcl 4.1;
 
 import std;
+import directors;
 
 # =======================================================
 # Varnish Cache - full page cache per WordPress
@@ -15,24 +16,44 @@ import std;
 # Il nome del segnaposto non va mai citato in un commento: lo script
 # rifiuta di partire se dopo la sostituzione ne trova ancora uno.
 
-backend default {
-    .host                   = "wordpress";
-    .port                   = "80";
-    .connect_timeout        = 5s;
-    .first_byte_timeout     = @BACKEND_TIMEOUT@s;
-    .between_bytes_timeout  = 60s;
-    .max_connections        = 500;
+# -------------------------------------------------------
+# Backend
+# -------------------------------------------------------
+# I backend non sono scritti qui: li genera varnish-entrypoint.sh, uno
+# per ogni indirizzo IPv4 a cui risponde il nome "wordpress".
+#
+# Il motivo: Varnish risolve il nome del backend a tempo di COMPILAZIONE
+# del VCL e accetta un solo indirizzo IPv4 per backend. Se il nome ne
+# restituisce piu' di uno - piu' repliche, oppure container rimasti
+# attaccati alla rete da un deploy precedente - la compilazione fallisce
+# con "resolves to too many addresses" e il container non parte affatto.
+#
+# Scegliendone uno a caso si rischia di puntare proprio a un container
+# morto. Con un backend per indirizzo piu' un director, invece, la probe
+# marca da sola come malati quelli che non rispondono e il director li
+# salta: lo stesso meccanismo che regge un vero pool di repliche.
 
-    # Se nginx smette di rispondere, Varnish se ne accorge da solo e puo'
-    # continuare a servire gli oggetti scaduti (vedi grace in vcl_hit):
-    # il sito resta in piedi in sola lettura invece di dare 503.
-    .probe = {
-        .url       = "/healthz";
-        .timeout   = 2s;
-        .interval  = 5s;
-        .window    = 5;
-        .threshold = 3;
-    }
+# Probe condivisa. initial = 0 fa partire ogni backend come MALATO: deve
+# guadagnarsi il traffico rispondendo, invece di riceverlo per default e
+# perdere richieste finche' la probe non se ne accorge. E' cio' che rende
+# innocuo un indirizzo rimasto in giro da un deploy vecchio.
+probe wp_healthz {
+    .url       = "/healthz";
+    .timeout   = 2s;
+    .interval  = 2s;
+    .window    = 3;
+    .threshold = 2;
+    .initial   = 0;
+}
+
+@BACKENDS@
+
+sub vcl_init {
+    # round_robin distribuisce fra i soli backend sani. Con un unico
+    # backend si comporta esattamente come un backend singolo, quindi il
+    # caso normale non paga nulla per questa flessibilita'.
+    new wp_cluster = directors.round_robin();
+@DIRECTOR_MEMBERS@
 }
 
 # Chi puo' invalidare la cache. Sono le reti private di Docker: dentro
@@ -46,6 +67,8 @@ acl purger {
 }
 
 sub vcl_recv {
+
+    set req.backend_hint = wp_cluster.backend();
 
     # ---------------------------------------------------
     # Sonda di salute di Varnish stesso
