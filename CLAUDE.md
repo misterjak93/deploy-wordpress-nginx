@@ -172,6 +172,37 @@ Le regex vengono valutate nell'ordine in cui compaiono, e un prefisso
 - `/wp-json/` è un prefisso semplice, non `^~`: con `^~` la regex che
   protegge `/wp-json/wp/v2/users` non verrebbe mai raggiunta.
 
+### Mai inviare `PATH_TRANSLATED` a php-fpm
+
+`99-wordpress.ini` imposta `cgi.fix_pathinfo = 0`, che è la scelta giusta
+per sicurezza. Ma con quel valore php-fpm **non** usa `SCRIPT_FILENAME`
+per decidere cosa eseguire: usa `PATH_TRANSLATED`, se lo riceve.
+
+Su una richiesta normale il path info è vuoto, quindi
+`$document_root$fastcgi_path_info` vale la sola docroot — una directory,
+senza estensione `.php`. Scatta `security.limit_extensions` e php-fpm
+risponde **403 con il corpo `Access denied.`** (esattamente 15 byte) per
+ogni singolo script: sito completamente inaccessibile.
+
+Il `fastcgi.conf` che molte guide copiano contiene quella riga. PHP
+ricava `PATH_TRANSLATED` da sé quando serve. Non reintrodurla.
+
+Sintomo riconoscibile: tutto ciò che resta in nginx funziona (404, 403,
+file statici), tutto ciò che arriva a PHP dà `Access denied.`.
+
+### `return` salta i controlli `allow`/`deny`
+
+`allow`/`deny` agiscono nella fase di **access**, che nginx esegue
+**dopo** quella di rewrite. Una location che risponde con `return` non
+arriva mai alla fase di access: i suoi `allow`/`deny` sono decorativi.
+
+È così che `/healthz` è rimasto raggiungibile da Internet, mentre
+`/php-fpm-status` (che non usa `return`) era correttamente protetto.
+
+Per gli endpoint che rispondono con `return`, il filtro va fatto con un
+`if` sulla mappa `$client_interno`, che sta nella stessa fase e lo
+precede.
+
 ### `add_header` non si eredita
 
 Appena una location ne dichiara uno, tutti quelli del livello superiore
@@ -293,6 +324,12 @@ era ambiguo nel tempo, era ambiguo **nello spazio**. Da qui gli alias.
 
 Lezione operativa: prima di dedurre, guardare. Un `docker ps` avrebbe
 risparmiato un giro completo.
+
+**403 `Access denied.` su tutto il sito.** Non era WordPress né nginx: era
+php-fpm, per `PATH_TRANSLATED` inviato insieme a `cgi.fix_pathinfo = 0`.
+Riprodotto in locale e dimostrato nei due sensi. Nella stessa occasione è
+emerso che `/healthz` era raggiungibile da Internet, perché `return`
+scavalca `allow`/`deny`.
 
 **Varnish non partiva, secondo giro:** `Backend host "wordpress":
 resolves to too many addresses` — tre indirizzi sulla rete interna. Da qui
