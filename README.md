@@ -80,6 +80,31 @@ Su tutti: **HTTPS ✅ + Automatic SSL**.
 
 Serve un accesso diretto per diagnosi? Aggiungi `dokploy-network` alle reti del servizio `wordpress` e un dominio dedicato, sapendo che quelle richieste saltano Varnish.
 
+### **Cambiare dominio a sito già installato**
+
+`DOMAIN` nel `.env` **non basta**, ed è il punto dove è facile perdere un pomeriggio.
+
+`WP_HOME` e `WP_SITEURL` vengono scritti in `wp-config.php` una volta sola, alla prima installazione: l'entrypoint rigenera `wp-config.php` solo se non esiste. Al riavvio con un `DOMAIN` nuovo cambiano il `server_name` di nginx e i messaggi nei log, ma WordPress continua a generare (e a redirezionare verso) il dominio vecchio, perché le due `define` vincono sui valori nel database.
+
+L'ordine che funziona:
+
+```bash
+# 1. le due define in wp-config.php, dentro al volume
+docker compose exec wordpress sed -i \
+  "s#https://vecchio.com#https://nuovo.com#g" /var/www/wordpress/html/wp-config.php
+
+# 2. i riferimenti dentro ai contenuti (link, immagini, campi serializzati)
+docker compose exec wordpress wp search-replace \
+  'https://vecchio.com' 'https://nuovo.com' --all-tables --precise --skip-columns=guid
+
+# 3. cache: i tre livelli hanno ancora dentro il dominio vecchio
+docker compose exec wordpress wp cache flush
+```
+
+Poi `DOMAIN=nuovo.com` nel `.env`, il dominio nuovo nella tab **Domains** di Dokploy (il certificato è legato a quello), e un redeploy. Infine **Svuota tutto** dalla voce Cache in bacheca.
+
+Due dettagli che si notano solo dopo: `WP_REDIS_PREFIX` e `WP_CACHE_KEY_SALT` contengono anch'essi il dominio vecchio — sono solo prefissi di chiavi, quindi cambiarli o lasciarli è indifferente, cambiarli equivale a svuotare l'object cache. E `--skip-columns=guid` non è facoltativo: i GUID dei contenuti sono identificatori storici, non indirizzi, e i lettori di feed si accorgono se cambiano.
+
 ---
 
 ## **🐘 4. PHP 8.3 / 8.4 / 8.5**
@@ -213,7 +238,13 @@ define( 'VHP_VARNISH_IP', 'varnish' );
 
 Senza questa define il plugin manderebbe i `PURGE` all'URL pubblico, quindi attraverso Traefik, e verrebbero **rifiutati**.
 
-Il motivo è nel VCL e vale la pena capirlo: l'ACL sulle reti private da sola non basterebbe, perché le richieste che arrivano da Traefik hanno come IP sorgente proprio Traefik, che sta in `172.16.0.0/12`. Chiunque da Internet potrebbe mandare un PURGE e superare l'ACL. Il discriminante vero è `X-Forwarded-For`: Varnish accoda sempre l'IP del chiamante all'header in arrivo, quindi una chiamata interna (`wordpress` → `varnish`) ne produce uno con **un solo** indirizzo, una passata da Traefik ne ha **almeno due**, separati da virgola. Se c'è una virgola, la richiesta viene da fuori e viene respinta.
+Chi può invalidare, e perché sono tre condizioni e non una:
+
+1. **L'ACL**, che contiene esattamente gli indirizzi dei container WordPress di *questo* progetto. La genera l'entrypoint di Varnish insieme ai backend, quindi si aggiorna da sola quando un container viene ricreato. Prima erano le reti private per intero, e non era la stessa cosa: `dokploy-network` è condivisa con tutti i progetti della macchina, quindi un container di un altro stack la superava.
+2. **`X-Forwarded-For`**, perché l'ACL da sola non basterebbe comunque: le richieste che arrivano da Traefik hanno come IP sorgente proprio Traefik. Varnish accoda sempre l'IP del chiamante all'header in arrivo, quindi una chiamata interna (`wordpress` → `varnish`) ne produce uno con **un solo** indirizzo, una passata da Traefik ne ha **almeno due**, separati da virgola. Se c'è una virgola, la richiesta viene da fuori e viene respinta.
+3. **`PURGE_TOKEN`**, facoltativo. Se lo imposti nel `.env` (arriva a entrambi i container), Varnish pretende anche l'header `X-Purge-Token`: l'ACL dice *da dove* arriva la richiesta, il token dice *chi* l'ha scritta.
+
+⚠️ Il token lo manda il mu-plugin dello stack, non i plugin di terze parti. Se usi **Proxy Cache Purge** per invalidare, lascia `PURGE_TOKEN` vuoto: le sue richieste riceverebbero `403` e la cache smetterebbe di svuotarsi — in silenzio, perché è il plugin a non accorgersene.
 
 A mano, dal terminale del servizio **varnish**:
 
@@ -386,6 +417,15 @@ primo visitatore trova la cache già piena. Gli indirizzi arrivano dalla
 sitemap di WordPress, e le richieste vanno a `127.0.0.1` — cioè a nginx
 nello stesso container: non dipendono da DNS, Traefik o certificato.
 
+Anche la **lettura** della sitemap passa da `127.0.0.1`, e avviene nel
+cron, non nella richiesta che ha scatenato l'invalidazione: l'indice più
+una richiesta per ogni sitemap figlia sono decine di chiamate HTTP, e
+farle mentre la bacheca aspetta significava tenere fermo chi salva un
+articolo. Per lo stesso motivo anche i `PURGE` verso Varnish partono a
+fine richiesta, dopo che la risposta è stata mandata: con Varnish
+irraggiungibile il salvataggio non rallenta di un millisecondo, mentre
+prima aspettava il timeout di ogni singolo URL coinvolto.
+
 ## **🖼 7. Immagini: AVIF e WebP**
 
 nginx serve automaticamente la variante moderna quando il browser la accetta, senza plugin lato PHP nel percorso della richiesta:
@@ -513,6 +553,26 @@ define( 'WP_SITEURL', 'https://tuosito.com' );
 
 `DISALLOW_FILE_EDIT` toglie di mezzo l'editor del pannello, che trasforma un account amministratore rubato in esecuzione di codice arbitrario. Gli URL fissi evitano il redirect loop dietro reverse proxy e impediscono di avvelenare l'URL del sito via header `Host`.
 
+### **`files` e `adminer`: due pannelli pubblicati su Internet**
+
+Sono comodi ed è il motivo per cui ci sono, ma vanno guardati per quello che sono: un file manager che scrive nella docroot con lo stesso utente di PHP, e un client del database. Entrambi stanno su `dokploy-network` con un dominio e un certificato, quindi la loro unica difesa è la password del pannello.
+
+Due cose, in ordine di importanza.
+
+**La sorgente di FileBrowser è `/srv/html/wp-content`**, non la radice del volume. Con `/srv` il pannello arrivava a `/srv/html`, cioè alla radice della docroot: un `.php` caricato lì viene eseguito da nginx — l'hardening copre `wp-content/uploads`, non la radice — e `wp-config.php`, con le credenziali del database, era leggibile e modificabile. Resta comunque un pannello di amministrazione: chi scrive in `wp-content` può modificare un tema, e modificare un tema è eseguire codice. Il percorso riduce il danno, non lo elimina.
+
+**Mettici davanti un'autenticazione**, o almeno una lista di IP. È un middleware Traefik: in Dokploy si aggiunge dal pannello (Advanced → Middlewares sul dominio del servizio) oppure con le label sul servizio. Per la basic auth serve una coppia `utente:hash` generata con `htpasswd -nbB utente password` (nelle label i `$` vanno raddoppiati):
+
+```yaml
+labels:
+  - "traefik.http.middlewares.pannelli-auth.basicauth.users=admin:$$2y$$05$$..."
+  - "traefik.http.routers.<nome-router>.middlewares=pannelli-auth"
+```
+
+⚠️ Il nome del router lo assegna Dokploy quando crea il dominio, e Dokploy riscrive il compose per iniettare le proprie label: verifica in `docker inspect` che le tue siano sopravvissute al deploy, invece di darlo per fatto.
+
+Se non ti servono di continuo, l'alternativa più semplice è non pubblicarli affatto: togli il dominio da Dokploy e raggiungili quando servono con un tunnel SSH verso la porta del container.
+
 ---
 
 ## **🧠 9. Redis (object cache)**
@@ -573,6 +633,8 @@ Copia `.env.example` e personalizzalo. Le variabili sono raggruppate per area e 
 | `DB_PASS`, `DB_ROOT_PASS` | |
 | `FB_ADMIN_PASSWORD` | Se resta vuota, FileBrowser parte con admin **senza password** |
 | `FIREWALL_BYPASS_COOKIE` | Cambia il valore di esempio |
+| `PURGE_TOKEN` | Facoltativo. Segreto per svuotare Varnish; lascialo vuoto se invalidi con un plugin di terze parti |
+| `TRUSTED_PROXIES` | Facoltativo. Gli hop di cui fidarsi per l'IP reale del visitatore; il default copre tutto lo spazio privato |
 
 ⚠️ Una variabile che non compare nella sezione `environment:` del servizio in `docker-compose.yml` **non arriva al container**, per quanto accuratamente sia impostata nel `.env`. Se aggiungi un knob tuo, aggiungilo in entrambi i posti.
 

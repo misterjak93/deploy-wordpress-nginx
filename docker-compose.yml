@@ -40,6 +40,10 @@ services:
       # NON "wordpress": vedi l'alias sul servizio wordpress qui sotto.
       - BACKEND_HOST=${BACKEND_HOST:-wp-upstream}
       - BACKEND_RECHECK_INTERVAL=${BACKEND_RECHECK_INTERVAL:-15}
+      # Segreto condiviso con WordPress per PURGE e BAN. Deve essere lo
+      # stesso valore su entrambi i servizi: vuoto su uno solo e le
+      # invalidazioni verrebbero rifiutate.
+      - PURGE_TOKEN=${PURGE_TOKEN:-}
     volumes:
       - ./varnish/default.vcl.template:/etc/varnish/default.vcl.template:ro
       - ./varnish/varnish-entrypoint.sh:/usr/local/bin/varnish-entrypoint.sh:ro
@@ -146,6 +150,10 @@ services:
       - RATE_LIMIT_XMLRPC_BURST=${RATE_LIMIT_XMLRPC_BURST:-5}
       - RATE_LIMIT_API_BURST=${RATE_LIMIT_API_BURST:-40}
       - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-1}
+      # Hop fidati per X-Forwarded-For. Vedi il commento nel .env.example:
+      # il default e' largo perche' l'indirizzo di Traefik non e'
+      # deducibile da dentro questo container.
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8}
 
       # --- Immagini ---
       - CONVERTED_DIR=${CONVERTED_DIR:-compressx-nextgen}
@@ -170,6 +178,9 @@ services:
       - INSTALL_MU_PLUGINS=${INSTALL_MU_PLUGINS:-1}
       # Letto dal mu-plugin per invalidare Varnish dall'interno.
       - VARNISH_HOST=varnish
+      # Stesso valore del servizio varnish: il mu-plugin lo manda come
+      # header X-Purge-Token su ogni PURGE e BAN.
+      - PURGE_TOKEN=${PURGE_TOKEN:-}
 
       # --- Manutenzione ---
       - WP_AUTO_INSTALL=${WP_AUTO_INSTALL:-1}

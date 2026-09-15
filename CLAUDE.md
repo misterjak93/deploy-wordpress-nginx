@@ -37,7 +37,24 @@ varnishd -C -f default.vcl
 # 3. Sintassi shell di ogni script.
 bash -n entrypoint.sh scripts/*.sh
 sh -n varnish/varnish-entrypoint.sh
+
+# 4. PHP del mu-plugin.
+php -l wordpress/mu-plugins/stack-cache.php
 ```
+
+E quando la modifica riguarda il comportamento, non la sintassi: nginx e
+Varnish si installano dai pacchetti (`apt-get install nginx-light
+varnish`) e si fanno girare **davvero**, uno davanti all'altro, con i
+template renderizzati. `varnish-entrypoint.sh` si avvia così com'è
+passandogli `VARNISH_RUNTIME_DIR`, `BACKEND_HOST=localhost` e
+`BACKEND_PORT` della nginx di prova.
+
+Costa dieci minuti ed è l'unico modo per contare gli **effetti** invece
+di leggere il codice: quale generazione di pagina torna dopo un PURGE,
+cosa riceve davvero il backend in `Accept-Encoding` (`varnishlog -i
+BereqHeader`), che codice risponde `/healthz` con una catena di header
+falsificata. Ogni guasto grave trovato finora in questo repository era
+silenzioso, e nessuno di loro sarebbe emerso da una rilettura.
 
 ---
 
@@ -96,6 +113,10 @@ Le richieste che arrivano da Traefik hanno l'IP di Traefik, che è in
 `172.16.0.0/12`. Il discriminante è il numero di indirizzi in
 `X-Forwarded-For`: una chiamata interna ne ha uno, una passata dal proxy
 almeno due.
+
+L'ACL, dal canto suo, non elenca più le reti private: la genera
+l'entrypoint dagli indirizzi dei backend. Vedi *L'ACL di Varnish per il
+purge si genera, non si scrive*, più in basso.
 
 ### Varnish risolve il backend a tempo di compilazione
 
@@ -401,6 +422,95 @@ container parte comunque, ma senza label: né rotta né certificato.
 Per quanto accuratamente sia impostata nel `.env`. Un nuovo knob va
 aggiunto in **entrambi** i posti.
 
+### L'invalidazione non si fa dentro alla richiesta della bacheca
+
+Ogni purge è una chiamata di rete, e `purge_post()` ne fa una per ogni
+URL coinvolto: permalink, homepage, feed, ogni archivio di termine,
+autore. Farle mentre l'amministratore aspetta significa che il tempo di
+salvataggio di un articolo è la somma di quelle chiamate — e con Varnish
+irraggiungibile è la somma dei loro timeout.
+
+Il lavoro si accumula in `$pending_urls` e parte su `shutdown`, con
+priorità `PHP_INT_MAX` e dopo `fastcgi_finish_request()`: a quel punto la
+risposta è già dal browser e nessuno sta aspettando.
+
+Due cose da non invertire se si tocca:
+
+- gli URL si **calcolano subito**, non a fine richiesta: `get_permalink()`
+  e `get_term_link()` di un contenuto appena cestinato non darebbero più
+  lo stesso indirizzo. A essere rimandata è solo la parte di rete;
+- le automazioni usano le varianti `queue_*`; `purge_all()` resta
+  sincrona perché la chiama il pulsante della bacheca, che deve poter
+  dire quanti file ha rimosso.
+
+La lettura delle sitemap è ancora più pesante (un indice più una
+richiesta per figlia) e sta su `wp_schedule_single_event`, non su
+`shutdown`. Va letta da `127.0.0.1` con l'header `Host`, come il preload:
+dall'URL pubblico uscirebbe e rientrerebbe da Traefik.
+
+### `$client_interno` non deve guardare `$remote_addr`
+
+`$remote_addr` lo riscrive `real_ip` a partire da `X-Forwarded-For`, che
+è scritto dal client. Con `set_real_ip_from` su tutto lo spazio privato e
+`real_ip_recursive on`, una catena di soli indirizzi privati fa adottare
+a nginx il **primo** della lista: `X-Forwarded-For: 10.0.0.1,
+192.168.1.5` rendeva "interna" una richiesta qualunque, e `/healthz`
+rispondeva 200.
+
+Il controllo guarda quindi `$realip_remote_addr` (chi ha davvero aperto
+la connessione) e il **numero** di indirizzi in `X-Forwarded-For`. È lo
+stesso discriminante del PURGE nel VCL, e regge per la stessa ragione:
+chi ne aggiunge uno fa solo crescere la catena, non può togliere quelli
+che Traefik e Varnish accodano dopo.
+
+`TRUSTED_PROXIES` resta largo di default e va bene così: gli hop sono due
+e uno è Traefik su `dokploy-network`, che questo container non può
+dedurre non essendoci sopra. Ma ormai decide solo quale IP finisce nei
+log e nei rate limit, non chi entra.
+
+### L'ACL di Varnish per il purge si genera, non si scrive
+
+Le reti private per intero non sono "i container di questo stack":
+`dokploy-network` è condivisa con tutti i progetti della macchina — la
+stessa ambiguità degli alias `wp-upstream` e `wp-mariadb` — quindi un
+container altrui superava sia l'ACL sia il test su `X-Forwarded-For`.
+
+L'ACL la genera `varnish-entrypoint.sh` dagli stessi indirizzi con cui
+genera i backend, quindi segue da sola i container ricreati. Non
+rimetterci una lista statica di sottoreti.
+
+`PURGE_TOKEN` è la terza condizione, facoltativa. Due cose da ricordare:
+finisce **grezzo** in una stringa VCL (un apice doppio non fa compilare
+il VCL, cioè Varnish non parte), e un plugin di terze parti non lo manda
+— attivarlo con Proxy Cache Purge in uso significa invalidazioni
+rifiutate con 403, in silenzio.
+
+### La normalizzazione di `Accept-Encoding` deve togliere prima i `q=0`
+
+Il confronto per sottostringa è ciò che rende la normalizzazione
+economica, ma `gzip, br;q=0` contiene `br` pur essendo un rifiuto
+esplicito: quel client riceveva brotli, cioè una pagina illeggibile.
+
+Nella regex che li rimuove, il delimitatore finale `(,|$)` è
+obbligatorio: senza, `gzip;q=0.5` verrebbe letto come `q=0` seguito da
+spazzatura e gzip sparirebbe pur essendo accettato.
+
+### Svuotare la cache di nginx è una rinomina, non una passata di unlink
+
+Su una cache da 2 GB sono decine di migliaia di file: iterarli dentro
+alla richiesta dell'amministratore costava minuti e lasciava indietro le
+directory vuote. `purge_nginx_all()` rinomina la directory in
+`.purge-<nome>-<epoch>`, la ricrea vuota e lascia la rimozione al cron, a
+lotti da 5000.
+
+È sicuro perché nginx apre i file di cache per percorso ad ogni
+richiesta: un file che non trova vale come MISS, esattamente come quando
+li si cancellava uno per uno. La directory va ricreata **subito** dopo la
+rinomina, o nginx logga un errore per ogni risposta cacheabile.
+
+Le directory messe da parte sono sorelle di quella di cache, non figlie:
+`nginx_status()` continua a contare solo le voci vive.
+
 ---
 
 ## Storico
@@ -532,61 +642,84 @@ accoda.
 
 ---
 
+### Le cinque cose rimandate dall'audit
+
+L'audit precedente aveva lasciato un elenco di reperti annotati invece
+che risolti, perché richiedevano una decisione di deploy o un refactor
+più ampio di quanto un audit debba portarsi dietro. Questo giro li ha
+ripresi uno per uno.
+
+Quattro erano lavoro vero e sono chiusi: purge e preload fuori dalla
+richiesta della bacheca, `$client_interno` sganciato da
+`X-Forwarded-For`, ACL del purge ristretta ai soli backend di questo
+progetto, `purge_nginx_all()` a rinomina più cron. Tre rifiniture
+(`Via` senza versione, `q=0` in `Accept-Encoding`, ref dei moduli nginx
+fissati a uno SHA) sono andate con loro.
+
+Uno è rimasto a metà per forza di cose: `set_real_ip_from` non può
+stringersi da solo, perché uno dei due hop da coprire è Traefik su
+`dokploy-network` e il container `wordpress` non sta su quella rete —
+di proposito. È diventato un knob (`TRUSTED_PROXIES`) e, soprattutto,
+ha smesso di essere ciò da cui dipende l'accesso agli endpoint interni.
+
+E uno è rimasto fuori dal repository: l'autenticazione davanti a `files`
+e `adminer` sono label Traefik, e le label le riscrive Dokploy. La
+sorgente di FileBrowser è però scesa dalla radice del volume a
+`wp-content`, che toglie di mezzo `wp-config.php` e la radice della
+docroot.
+
+Tutto verificato facendo girare le cose, non leggendole: nginx e Varnish
+installati e avviati uno davanti all'altro, `/healthz` interrogato con
+catene di `X-Forwarded-For` falsificate (la mappa precedente rispondeva
+200, quella nuova 403), PURGE e BAN contati sulla generazione di pagina
+che tornava indietro invece che sul codice di stato, e la
+normalizzazione di `Accept-Encoding` letta in `varnishlog -i
+BereqHeader` per vedere cosa riceve davvero il backend.
+
+Un dettaglio che vale la pena ricordare: con il token attivo un PURGE
+senza header risponde **403**, e la cache resta vecchia. È di nuovo la
+forma «la cache risponde qualcosa che non è un errore» — solo che
+stavolta l'errore c'è ed è visibile. Chi usa un plugin di invalidazione
+di terze parti non lo vedrebbe comunque: per questo il token è
+facoltativo e il caso è scritto nel `.env.example`.
+
+---
+
 ## Cose note e non risolte
 
-- **Purge e preload girano dentro alla richiesta della bacheca.**
-  `purge_post()` fa una `wp_remote_request` sincrona da 5s per ogni URL
-  coinvolto (permalink, homepage, feed, ogni archivio di termine, autore):
-  con Varnish irraggiungibile il salvataggio di un articolo aspetta oltre
-  un minuto. `purge_all()` — agganciato a cambio tema, attivazione plugin,
-  *ogni* modifica di termine, personalizzatore, fine aggiornamento —
-  chiama anche `queue_preload_from_sitemap()`, che scarica l'indice delle
-  sitemap **e una richiesta per ogni sitemap figlia**, timeout 10s l'una,
-  verso l'URL pubblico. Va spostato su `shutdown` e su
-  `wp_schedule_single_event`, e le sitemap vanno lette da `127.0.0.1` con
-  l'header `Host` come già fa il preload.
-- **`set_real_ip_from` si fida di tutto lo spazio privato**, con
-  `real_ip_recursive on`. Se *tutti* gli indirizzi in `X-Forwarded-For`
-  sono privati nginx adotta il primo della lista, cioè quello scritto dal
-  client, e `$client_interno` diventa 1. Nella catena reale non succede
-  (Traefik accoda l'indirizzo vero del peer, che è pubblico, e la risalita
-  si ferma lì), ma la garanzia sta nel bordo, non qui. Il perimetro andrebbe
-  ristretto alla sottorete del progetto: gli hop fidati sono due e sono noti.
-- **L'ACL `purger` non distingue i vicini di casa.** `dokploy-network` è
-  condivisa con tutti i progetti della macchina — è la ragione per cui
-  esistono gli alias `wp-upstream` e `wp-mariadb` — quindi un container di
-  un altro stack soddisfa sia l'ACL sia il test «un solo indirizzo in
-  `X-Forwarded-For`», e può mandare un `BAN`. La difesa vera è un segreto
-  condiviso (`X-Purge-Token` dal `.env`) confrontato nel VCL insieme all'ACL;
-  la validazione dell'espressione di ban, già in piedi, copre solo il caso
-  peggiore.
-- **FileBrowser scrive nella radice della docroot.** Monta
-  `wordpress_data` su `/srv` come uid 33 ed è pubblicato da Traefik:
-  scrivere un `.php` in `html/` è esecuzione di codice, e l'hardening
-  copre `wp-content/uploads`, non la radice. Puntare la sorgente su
-  `/srv/html/wp-content` coprirebbe il caso d'uso reale; davanti a `files`
-  e `adminer` servirebbe comunque un middleware Traefik di basic-auth o una
-  lista di IP.
-- **`purge_nginx_all()` non ha il tetto che ha `nginx_status()`.** Su una
-  cache da 2 GB itera e cancella senza limite dentro alla richiesta
-  dell'amministratore, e lascia le directory vuote. Meglio rinominare la
-  directory e ricrearla vuota, lasciando la rimozione a un evento
-  pianificato.
-- **`NGX_BROTLI_REF` e `NGX_ZSTD_REF` sono su `master`.** Due build a
-  distanza di un mese producono moduli diversi senza che niente nel
-  repository sia cambiato. Vanno fissati su un tag o uno SHA, ma la scelta
-  richiede un build vero per verificare che quel ref compili con la nginx
-  della distribuzione — cosa che qui non si può fare. (`wp-cli.phar` invece
-  è già verificato con lo sha512 pubblicato.)
-- **`Via: 1.1 varnish (Varnish/7.7)`** esce su ogni risposta, mentre lo
-  stack nasconde le versioni di nginx e di PHP. È l'header che ha
-  identificato il 503 raccontato qui sopra, quindi è una scelta da fare
-  consapevolmente: `set resp.http.Via = "1.1 varnish";` terrebbe l'hop
-  visibile senza il numero di versione.
-- **La normalizzazione di `Accept-Encoding` è per sottostringa.** Un client
-  che manda `gzip, br;q=0` sta *rifiutando* brotli e riceve brotli. Raro,
-  ma è la classe di bug che si manifesta come «un browser vede la pagina
-  illeggibile».
+- **`files` e `adminer` non hanno niente davanti.** Sono due pannelli di
+  amministrazione pubblicati da Traefik con la sola password
+  dell'applicazione. La sorgente di FileBrowser ora è
+  `/srv/html/wp-content` invece della radice del volume — fuori restano
+  `wp-config.php` e la radice della docroot, dove un `.php` caricato
+  verrebbe eseguito — ma chi scrive in `wp-content` può comunque
+  modificare un tema, e modificare un tema è eseguire codice. Serve un
+  middleware Traefik di basic-auth o una lista di IP; il README spiega
+  come, e non è nel repository perché le label le riscrive Dokploy e
+  vanno verificate sul deploy reale.
+- **`set_real_ip_from` si fida ancora di tutto lo spazio privato** per
+  default. Ora è `TRUSTED_PROXIES` e si può stringere, ma il default deve
+  restare largo: uno dei due hop è Traefik su `dokploy-network`, che il
+  container `wordpress` non può dedurre non essendo su quella rete.
+  L'esposizione residua è l'IP che finisce nei log e nei rate limit, non
+  più l'accesso agli endpoint interni.
+- **`PURGE_TOKEN` è facoltativo e di default vuoto.** Con l'ACL ristretta
+  ai soli backend il vicino di casa non passa più, ma la difesa contro
+  chi possa falsificare l'indirizzo di origine si attiva solo se lo si
+  imposta — e attivarlo rompe i plugin di invalidazione di terze parti,
+  che non lo conoscono. Non c'è modo di avere entrambe le cose senza
+  scegliere.
+- **`NGX_BROTLI_REF` e `NGX_ZSTD_REF` sono fissati a uno SHA**, ma quei
+  due SHA non sono mai stati compilati: qui non c'è un demone Docker. Il
+  build resta la prima occasione in cui si scopre se compilano con la
+  nginx della distribuzione. Pinnarli non ha aggiunto rischio — sono la
+  testa di `master` al momento del pin, cioè quello che il build avrebbe
+  preso comunque — ma non ne ha tolto.
+- **La normalizzazione di `Accept` sulle immagini è ancora per
+  sottostringa.** Stessa famiglia del `q=0` di `Accept-Encoding`, risolto
+  invece nel VCL. Qui l'effetto è più lieve (un browser che *rifiuta*
+  esplicitamente `image/avif` ma lo elenca) e la stessa logica sta anche
+  nelle mappe di nginx, quindi andrebbero corrette insieme.
 - **`deb.sury.org` pubblica già PHP 8.6**, ma senza `php8.6-redis`, che
   qui è obbligatorio. Il build si ferma dicendolo per nome.
 - **Nessuna Content-Security-Policy.** Una CSP sensata dipende da tema e

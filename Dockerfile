@@ -20,8 +20,22 @@ ARG DEBIAN_CODENAME=trixie
 # nello stage finale senza replicare la sua riga di configure.
 FROM debian:${DEBIAN_CODENAME}-slim AS nginx-modules
 
-ARG NGX_BROTLI_REF=master
-ARG NGX_ZSTD_REF=master
+# Commit fissi, non "master".
+#
+# Con un branch mobile due build a distanza di un mese producono moduli
+# diversi senza che niente in questo repository sia cambiato: se il
+# secondo non parte, non c'e' modo di sapere cosa sia cambiato ne' di
+# tornare indietro.
+#
+# I due SHA sono la testa di master al momento in cui sono stati fissati,
+# quindi il build produce esattamente quello che avrebbe prodotto prima:
+# cambia solo che adesso e' ripetibile. Per aggiornarli si passa il nuovo
+# SHA come build arg e si guarda il build, che e' l'unico posto dove si
+# scopre se quel ref compila ancora con la nginx della distribuzione.
+#
+# Il valore puo' essere uno SHA, un tag o un branch: vedi il fetch sotto.
+ARG NGX_BROTLI_REF=a71f9312c2deb28875acc7bacfdd5695a111aa53
+ARG NGX_ZSTD_REF=057a7d339af1111d04b5a9ac5ae9b0250d17cd94
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN set -eux; \
@@ -43,14 +57,24 @@ RUN set -eux; \
     echo "nginx di distribuzione: $(cat /tmp/nginx.version)"; \
     rm -rf /var/lib/apt/lists/*
 
+# "git clone --branch" non accetta uno SHA, solo branch e tag. Con
+# init + fetch del ref si prendono tutti e tre, restando shallow.
 RUN set -eux; \
+    fetch_ref() { \
+        mkdir -p "$1"; cd "$1"; \
+        git init -q .; \
+        git remote add origin "$2"; \
+        git fetch -q --depth=1 origin "$3"; \
+        git checkout -q FETCH_HEAD; \
+    }; \
     NGINX_VERSION="$(cat /tmp/nginx.version)"; \
     cd /usr/src; \
     curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" | tar -xz; \
-    git clone --depth=1 --branch "${NGX_BROTLI_REF}" --recurse-submodules --shallow-submodules \
-        https://github.com/google/ngx_brotli.git; \
-    git clone --depth=1 --branch "${NGX_ZSTD_REF}" \
-        https://github.com/tokers/zstd-nginx-module.git
+    fetch_ref /usr/src/ngx_brotli https://github.com/google/ngx_brotli.git "${NGX_BROTLI_REF}"; \
+    git -C /usr/src/ngx_brotli submodule update --init --recursive --depth 1; \
+    fetch_ref /usr/src/zstd-nginx-module https://github.com/tokers/zstd-nginx-module.git "${NGX_ZSTD_REF}"; \
+    echo "ngx_brotli      $(git -C /usr/src/ngx_brotli rev-parse HEAD)"; \
+    echo "zstd-nginx-module $(git -C /usr/src/zstd-nginx-module rev-parse HEAD)"
 
 # libbrotli viene compilata statica dentro al modulo: nell'immagine finale
 # non serve nessuna libreria brotli a runtime.

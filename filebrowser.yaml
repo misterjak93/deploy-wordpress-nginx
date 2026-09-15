@@ -14,10 +14,26 @@ server:
   cacheDir: "/home/filebrowser/data/tmp"
 
   sources:
-    # Qui e' montato il volume wordpress_data: dentro ci sono html/ (la
-    # docroot) e logs/. Per vedere solo il sito, usa "/srv/html".
-    - path: "/srv"
-      name: "WordPress"
+    # Il volume wordpress_data e' montato su /srv, ma la sorgente NON e'
+    # la sua radice.
+    #
+    # Con "/srv" il pannello scriveva dentro a /srv/html, cioe' nella
+    # radice della docroot: da li' un .php caricato viene eseguito da
+    # nginx (l'hardening copre wp-content/uploads, non la radice) e
+    # wp-config.php era leggibile e modificabile. FileBrowser gira come
+    # uid 33 ed e' pubblicato da Traefik: e' una porta che non vale la
+    # pena tenere aperta per il caso d'uso reale, che e' gestire media,
+    # temi e plugin.
+    #
+    # Resta comunque un pannello di amministrazione: chi scrive in
+    # wp-content puo' modificare un tema, e modificare un tema e'
+    # eseguire codice. La difesa e' l'autenticazione davanti al servizio,
+    # non questo percorso - vedi la sezione "files e adminer" nel README.
+    #
+    # Per tornare a vedere tutto (docroot, logs, wp-config.php) rimetti
+    # "/srv", sapendo cosa comporta.
+    - path: "/srv/html/wp-content"
+      name: "Contenuti WordPress"
       config:
         defaultEnabled: true
 
