@@ -44,9 +44,17 @@ services:
     # RAM: senza, ogni scrittura passerebbe dal filesystem overlay del
     # container, che e' la configurazione peggiore possibile per una cache.
     tmpfs:
-      - /var/lib/varnish:exec,size=256m
+      # mode=1777 esplicito: il container gira come utente "varnish" e deve
+      # poter creare qui la propria directory di lavoro.
+      - /var/lib/varnish:exec,mode=1777,size=256m
+      # /etc/varnish e' sola lettura per quell'utente. Il VCL generato, il
+      # secret e le temporanee di "varnishd -C" vanno qui.
+      # Un volume nominato NON andrebbe bene: nasce root:root e l'utente
+      # varnish non potrebbe scriverci. Tutto cio' che finisce qui viene
+      # comunque rigenerato ad ogni avvio.
+      - /tmp/varnish:mode=1777,size=16m
     healthcheck:
-      test: ["CMD-SHELL", "varnishadm ping || exit 1"]
+      test: ["CMD-SHELL", "varnishadm -T 127.0.0.1:6082 -S /tmp/varnish/secret ping || exit 1"]
       interval: 30s
       timeout: 5s
       start_period: 20s

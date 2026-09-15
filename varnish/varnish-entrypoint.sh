@@ -7,8 +7,26 @@
 # non aggiunge un pacchetto solo per questo.
 set -eu
 
+# -------------------------------------------------------
+# Directory di lavoro
+# -------------------------------------------------------
+# L'immagine ufficiale gira come utente "varnish", non root, e ha
+# WorkingDir /etc/varnish: quella directory NON e' scrivibile.
+# Tre cose ne dipendono, e sbagliarne una sola basta a non far partire
+# il container:
+#   1. il VCL generato da questo script;
+#   2. il file secret dell'interfaccia di amministrazione;
+#   3. "varnishd -C", che scrive le proprie temporanee nella directory
+#      corrente - per questo piu' sotto ci si sposta qui dentro.
+RUNTIME_DIR="${VARNISH_RUNTIME_DIR:-/tmp/varnish}"
+mkdir -p "${RUNTIME_DIR}" || {
+    echo "ERRORE: impossibile creare ${RUNTIME_DIR}." >&2
+    exit 1
+}
+cd "${RUNTIME_DIR}"
+
 TEMPLATE=/etc/varnish/default.vcl.template
-TARGET=/etc/varnish/default.vcl
+TARGET="${RUNTIME_DIR}/default.vcl"
 
 VARNISH_SIZE="${VARNISH_SIZE:-256m}"
 VARNISH_TTL="${VARNISH_TTL:-6h}"
@@ -57,6 +75,11 @@ fi
 # -------------------------------------------------------
 # Generazione del VCL
 # -------------------------------------------------------
+if [ ! -r "${TEMPLATE}" ]; then
+    echo "ERRORE: ${TEMPLATE} non leggibile. Verifica il mount in docker-compose.yml." >&2
+    exit 1
+fi
+
 sed -e "s|@BACKEND_TIMEOUT@|${VARNISH_BACKEND_TIMEOUT}|g" \
     -e "s|@DEFAULT_TTL@|${VARNISH_TTL}|g" \
     -e "s|@STATIC_TTL@|${VARNISH_STATIC_TTL}|g" \
@@ -92,7 +115,17 @@ fi
 
 # Compilazione di prova: un VCL rotto deve fermare il deploy con l'errore
 # del compilatore, non lasciare Varnish in crash loop senza spiegazioni.
-varnishd -C -f "${TARGET}" > /dev/null
+#
+# L'output va catturato, non rediretto a /dev/null: "varnishd -C" stampa
+# il sorgente C generato (circa 110 KB) su STDERR, non su stdout. Un
+# ">/dev/null" non lo intercetta e ad ogni avvio il log del container si
+# riempie di codice C. Cosi' invece in caso di successo non si stampa
+# nulla, e in caso di errore si stampa tutto.
+if ! vcc_output=$(varnishd -C -f "${TARGET}" 2>&1); then
+    echo "ERRORE: il VCL non compila." >&2
+    echo "${vcc_output}" >&2
+    exit 1
+fi
 
 echo "Varnish: cache ${VARNISH_SIZE} | ttl ${VARNISH_TTL} | statici ${VARNISH_STATIC_TTL} | grace ${VARNISH_GRACE}"
 echo "Varnish: priorita' compressione ${COMPRESSION_PRIORITY}"
@@ -100,10 +133,17 @@ echo "Varnish: priorita' compressione ${COMPRESSION_PRIORITY}"
 # Interfaccia di amministrazione su loopback. Serve all'healthcheck
 # ("varnishadm ping") e ai comandi manuali di invalidazione; non e'
 # raggiungibile da fuori dal container.
-SECRET_FILE=/etc/varnish/secret
+# Anche il secret sta in RUNTIME_DIR: /etc/varnish e' sola lettura.
+# Se l'immagine ne fornisce gia' uno leggibile si riusa quello, cosi' un
+# varnishadm lanciato a mano senza -S trova comunque la stessa chiave.
+SECRET_FILE="${RUNTIME_DIR}/secret"
 if [ ! -s "${SECRET_FILE}" ]; then
-    dd if=/dev/urandom of="${SECRET_FILE}" bs=1 count=64 2>/dev/null
-    chmod 600 "${SECRET_FILE}"
+    if [ -r /etc/varnish/secret ]; then
+        cp /etc/varnish/secret "${SECRET_FILE}"
+    else
+        dd if=/dev/urandom of="${SECRET_FILE}" bs=1 count=64 2>/dev/null
+    fi
+    chmod 600 "${SECRET_FILE}" 2>/dev/null || true
 fi
 
 # -------------------------------------------------------
