@@ -238,6 +238,73 @@ ricava `PATH_TRANSLATED` da sé quando serve. Non reintrodurla.
 Sintomo riconoscibile: tutto ciò che resta in nginx funziona (404, 403,
 file statici), tutto ciò che arriva a PHP dà `Access denied.`.
 
+### Nemmeno `PATH_INFO`, e per la stessa ragione
+
+Stessa famiglia del vincolo qui sopra, stesso corpo `Access denied.`, ma
+si manifesta solo sugli endpoint che **non sono file**.
+
+`fastcgi_param PATH_INFO $fastcgi_path_info` lo mandava vuoto ma
+**presente**, e tanto basta: php-fpm prende il ramo path-info e valuta
+`security.limit_extensions` su un nome derivato dalla docroot senza
+estensione `.php`. Sulle pagine non si vedeva — lì il nome finisce
+davvero in `.php`. Si vedeva su `/php-fpm-status` e `/healthz-php`, che
+rispondevano **403** invece di servire `pm.status_path` e `ping.path`: il
+gestore delle due sonde non veniva nemmeno raggiunto.
+
+In questo stack il path info è *strutturalmente* sempre vuoto — ogni
+location PHP o ha `try_files $uri =404` o è un match esatto — quindi le
+due righe (`fastcgi_split_path_info` e il parametro) non portavano nulla.
+Se un domani servisse davvero, va in uno snippet separato incluso solo
+dalle location che lo usano, **mai** in quelle diagnostiche.
+
+Verificato isolando la richiesta con `cgi-fcgi`: stessi identici parametri
+senza `PATH_INFO` → `pong`.
+
+### `vcl_hash` include `X-Forwarded-Proto`, quindi ogni chiamata interna deve mandarlo
+
+Le richieste dei visitatori passano da Traefik e l'header ce l'hanno
+sempre: ogni oggetto in cache è indicizzato su `url + host + "https"`.
+Una chiamata interna che non lo manda calcola un hash diverso e non trova
+niente — e `return (purge)` sintetizza **sempre** un 200, che l'oggetto ci
+fosse o no.
+
+Risultato: `purge_post()` (cioè la strada normale per ogni pubblicazione,
+modifica e commento, con `purge_scope: related`) non ha mai toccato
+Varnish. Funzionava solo «svuota tutto», che passa da un `BAN` sugli
+header dell'oggetto e quindi non dipende dall'hash. Nessun errore, nessun
+log: l'articolo corretto restava vecchio fino alla scadenza del TTL.
+
+Il default sta in cima a `vcl_recv`, **prima** del blocco PURGE/BAN e di
+qualunque `return`. Lì copre anche i plugin di terze parti, su cui il
+mu-plugin non ha voce (`VHP_VARNISH_IP` è definito in `wp-config.php`).
+
+### `xml` e `txt` non vanno nella location degli statici
+
+Lì la regola è `try_files $uri =404`, giusta per un `.css` che o c'è o non
+c'è. Ma xml e txt sono anche risorse che WordPress **genera**: le sitemap
+del core (`/wp-sitemap.xml` e figlie, attive per default dalla 5.5),
+quelle dei plugin SEO, un `ads.txt` gestito da plugin. Nella regex degli
+statici rispondevano tutte 404.
+
+L'effetto peggiore era interno: `collect_sitemap_urls()` chiede
+`/wp-sitemap.xml` per costruire la coda di preload, riceveva 404 e
+ripiegava in silenzio sugli ultimi 100 contenuti. Il «preload dalla
+sitemap» descritto nel README non ha mai letto una sitemap.
+
+### Il cookie di bypass del firewall deve fallire chiuso
+
+Spegne **tutto** il firewall, quindi il valore di esempio non può essere
+funzionante: è pubblicato in tre punti del repository e un avviso nei log
+non basta (si legge una volta, il default resta).
+
+E finisce **grezzo** dentro a una PCRE. Una parentesi tonda — che un
+generatore di password produce senza pensarci — rende la mappa non
+compilabile e **nginx non parte**; un punto o un asterisco allargano il
+bypass a quasi qualunque cookie. L'entrypoint accetta quindi solo
+`[A-Za-z0-9_-]+` e, in ogni altro caso, sostituisce un valore casuale che
+nessuno può indovinare: la mappa resta (il template la dichiara sempre) ma
+non può scattare.
+
 ### `return` salta i controlli `allow`/`deny`
 
 `allow`/`deny` agiscono nella fase di **access**, che nginx esegue
@@ -287,6 +354,13 @@ Se divergono, l'invalidazione smette di funzionare **senza errori**: il
 plugin cancella file che non esistono e il sito serve contenuto vecchio.
 Verificato confrontando il percorso calcolato dal plugin con il file
 davvero scritto da nginx.
+
+Il metodo resta nella chiave apposta: senza, una HEAD in MISS
+memorizzerebbe una risposta **senza corpo**, che verrebbe poi servita a
+una GET. Il prezzo è che GET e HEAD sono due voci distinte, quindi il
+plugin deve cancellarle **entrambe** — `nginx_paths_for_url()` restituisce
+i due percorsi. Prima cancellava solo la GET, e le voci HEAD (monitor
+esterni, anteprime di link, crawler) restavano fino a `inactive=60d`.
 
 ### `add_header` non si eredita
 
@@ -422,10 +496,97 @@ i backend generati più il director descritti sopra. Il messaggio d'errore
 era leggibile solo grazie al fix precedente sullo stderr: prima sarebbe
 stato sepolto in 110 KB di sorgente C.
 
+### Audit completo dello stack
+
+Montato e fatto girare per davvero, invece che letto: template
+renderizzati con gli stessi `envsubst` e la stessa logica `sed`
+dell'entrypoint, VCL compilato, nginx e PHP-FPM avviati con quelle
+configurazioni, richieste con `curl` e — dove serviva togliere nginx dal
+ragionamento — con `cgi-fcgi` direttamente sul socket del pool.
+
+Venti reperti, tredici riprodotti. I tre gravi erano tutti **silenziosi**,
+e due erano esattamente la classe di difetto che questo file definisce la
+peggiore in una cache:
+
+- il `PURGE` di una singola pagina non ha mai invalidato niente e
+  rispondeva 200 (vedi *`vcl_hash` include `X-Forwarded-Proto`*);
+- le due sonde di PHP-FPM rispondevano 403 `Access denied.` da sempre
+  (vedi *Nemmeno `PATH_INFO`*) — il README le documenta come lo strumento
+  per tarare `PHP_CONCURRENCY`;
+- il cookie di bypass d'esempio era una chiave funzionante distribuita nel
+  repository.
+
+Lezione operativa, gemella di «prima di dedurre, guardare»: **una cache
+che risponde 200 non sta dicendo che ha fatto qualcosa.** Entrambi i
+guasti sopravvivevano perché nessuno dei due produceva un errore, e la
+verifica che li ha trovati ha contato gli effetti (quale generazione di
+pagina tornava dal backend) invece di fidarsi del codice di stato.
+
+Cosa ha retto, verificato nella stessa occasione: la chiave di cache di
+nginx e il calcolo del plugin coincidono carattere per carattere;
+`PATH_TRANSLATED` è rimasto fuori; l'hardening dei percorsi regge
+(`wp-config.php` 404, `.php` in `uploads` 403, `xmlrpc` 444); il rate
+limit su `wp-login.php` respinge 29 richieste su 40; una catena
+`X-Forwarded-For` falsificata non sopravvive all'hop pubblico che Traefik
+accoda.
+
 ---
 
 ## Cose note e non risolte
 
+- **Purge e preload girano dentro alla richiesta della bacheca.**
+  `purge_post()` fa una `wp_remote_request` sincrona da 5s per ogni URL
+  coinvolto (permalink, homepage, feed, ogni archivio di termine, autore):
+  con Varnish irraggiungibile il salvataggio di un articolo aspetta oltre
+  un minuto. `purge_all()` — agganciato a cambio tema, attivazione plugin,
+  *ogni* modifica di termine, personalizzatore, fine aggiornamento —
+  chiama anche `queue_preload_from_sitemap()`, che scarica l'indice delle
+  sitemap **e una richiesta per ogni sitemap figlia**, timeout 10s l'una,
+  verso l'URL pubblico. Va spostato su `shutdown` e su
+  `wp_schedule_single_event`, e le sitemap vanno lette da `127.0.0.1` con
+  l'header `Host` come già fa il preload.
+- **`set_real_ip_from` si fida di tutto lo spazio privato**, con
+  `real_ip_recursive on`. Se *tutti* gli indirizzi in `X-Forwarded-For`
+  sono privati nginx adotta il primo della lista, cioè quello scritto dal
+  client, e `$client_interno` diventa 1. Nella catena reale non succede
+  (Traefik accoda l'indirizzo vero del peer, che è pubblico, e la risalita
+  si ferma lì), ma la garanzia sta nel bordo, non qui. Il perimetro andrebbe
+  ristretto alla sottorete del progetto: gli hop fidati sono due e sono noti.
+- **L'ACL `purger` non distingue i vicini di casa.** `dokploy-network` è
+  condivisa con tutti i progetti della macchina — è la ragione per cui
+  esistono gli alias `wp-upstream` e `wp-mariadb` — quindi un container di
+  un altro stack soddisfa sia l'ACL sia il test «un solo indirizzo in
+  `X-Forwarded-For`», e può mandare un `BAN`. La difesa vera è un segreto
+  condiviso (`X-Purge-Token` dal `.env`) confrontato nel VCL insieme all'ACL;
+  la validazione dell'espressione di ban, già in piedi, copre solo il caso
+  peggiore.
+- **FileBrowser scrive nella radice della docroot.** Monta
+  `wordpress_data` su `/srv` come uid 33 ed è pubblicato da Traefik:
+  scrivere un `.php` in `html/` è esecuzione di codice, e l'hardening
+  copre `wp-content/uploads`, non la radice. Puntare la sorgente su
+  `/srv/html/wp-content` coprirebbe il caso d'uso reale; davanti a `files`
+  e `adminer` servirebbe comunque un middleware Traefik di basic-auth o una
+  lista di IP.
+- **`purge_nginx_all()` non ha il tetto che ha `nginx_status()`.** Su una
+  cache da 2 GB itera e cancella senza limite dentro alla richiesta
+  dell'amministratore, e lascia le directory vuote. Meglio rinominare la
+  directory e ricrearla vuota, lasciando la rimozione a un evento
+  pianificato.
+- **`NGX_BROTLI_REF` e `NGX_ZSTD_REF` sono su `master`.** Due build a
+  distanza di un mese producono moduli diversi senza che niente nel
+  repository sia cambiato. Vanno fissati su un tag o uno SHA, ma la scelta
+  richiede un build vero per verificare che quel ref compili con la nginx
+  della distribuzione — cosa che qui non si può fare. (`wp-cli.phar` invece
+  è già verificato con lo sha512 pubblicato.)
+- **`Via: 1.1 varnish (Varnish/7.7)`** esce su ogni risposta, mentre lo
+  stack nasconde le versioni di nginx e di PHP. È l'header che ha
+  identificato il 503 raccontato qui sopra, quindi è una scelta da fare
+  consapevolmente: `set resp.http.Via = "1.1 varnish";` terrebbe l'hop
+  visibile senza il numero di versione.
+- **La normalizzazione di `Accept-Encoding` è per sottostringa.** Un client
+  che manda `gzip, br;q=0` sta *rifiutando* brotli e riceve brotli. Raro,
+  ma è la classe di bug che si manifesta come «un browser vede la pagina
+  illeggibile».
 - **`deb.sury.org` pubblica già PHP 8.6**, ma senza `php8.6-redis`, che
   qui è obbligatorio. Il build si ferma dicendolo per nome.
 - **Nessuna Content-Security-Policy.** Una CSP sensata dipende da tema e

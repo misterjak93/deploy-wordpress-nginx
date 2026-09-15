@@ -81,6 +81,28 @@ sub vcl_recv {
     unset req.http.X-Stack-Bypass;
 
     # ---------------------------------------------------
+    # Schema: un valore di default, e deve stare QUI
+    # ---------------------------------------------------
+    # vcl_hash aggiunge X-Forwarded-Proto alla chiave quando c'e'. Le
+    # richieste dei visitatori passano da Traefik e ce l'hanno sempre,
+    # quindi ogni oggetto in cache e' indicizzato su url+host+"https".
+    # Una chiamata interna che non lo manda - il PURGE del mu-plugin, un
+    # plugin di terze parti, uno script - calcola un hash diverso e non
+    # trova nulla: Varnish risponde comunque 200 ("return (purge)"
+    # sintetizza sempre un 200, che l'oggetto ci fosse o no) e
+    # l'invalidazione della singola pagina non funziona MAI, in silenzio.
+    #
+    # Dando qui il default, ogni chiamata interna si hasha come una che e'
+    # arrivata dal bordo. Deve stare prima del blocco PURGE/BAN e prima di
+    # qualunque return, altrimenti non serve a niente.
+    #
+    # "https" e non "http": l'unica strada per arrivare qui dall'esterno e'
+    # Traefik, che termina TLS e l'header lo mette sempre.
+    if (!req.http.X-Forwarded-Proto) {
+        set req.http.X-Forwarded-Proto = "https";
+    }
+
+    # ---------------------------------------------------
     # Sonda di salute di Varnish stesso
     # ---------------------------------------------------
     if (req.url == "/varnish-health") {
@@ -111,7 +133,19 @@ sub vcl_recv {
         # BAN accetta un'espressione regolare sull'URL: e' quello che usano
         # i plugin per invalidare un intero gruppo di pagine in un colpo
         # (per esempio tutto l'archivio di una categoria).
+        #
+        # L'espressione viene concatenata dentro a una condizione VCL, quindi
+        # chi la scrive puo' aggiungere clausole proprie con "&&" o "||" e
+        # far bannare qualcosa di diverso da cio' che l'ACL intendeva
+        # concedere. Qui arriva solo traffico interno, ma "interno" su
+        # dokploy-network vuol dire anche i container degli altri progetti
+        # (e' la stessa ambiguita' che ha richiesto gli alias wp-upstream e
+        # wp-mariadb). Si accettano quindi solo espressioni che non possono
+        # chiudere il confronto e aprirne un altro.
         if (req.http.X-Ban-Expression) {
+            if (req.http.X-Ban-Expression ~ "(&&|\|\||obj\.|req\.|bereq\.|\n)") {
+                return (synth(400, "Espressione di ban non ammessa"));
+            }
             ban("obj.http.X-Cache-Host == " + req.http.host
                 + " && obj.http.X-Cache-Url ~ " + req.http.X-Ban-Expression);
         } else {
@@ -468,6 +502,11 @@ sub vcl_deliver {
     unset resp.http.X-Cache-Url;
     # Istruzione destinata a nginx, non al browser.
     unset resp.http.X-Accel-Expires;
+    # Istruzione destinata a Varnish, non al browser. Sulle risposte
+    # cacheabili la toglie gia' vcl_backend_response, ma su quelle nate da
+    # un pass quel ramo ritorna prima di arrivarci: senza questa riga
+    # l'header usciva verso il visitatore su tutta la bacheca.
+    unset resp.http.X-WP-Varnish-TTL;
     unset resp.http.X-Powered-By;
     unset resp.http.Server;
     unset resp.http.X-Pingback;
