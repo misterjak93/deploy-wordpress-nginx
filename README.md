@@ -406,9 +406,21 @@ document.cookie = "IL-TUO-VALORE=1; path=/; SameSite=Lax; Secure";
 
 - **PHP non eseguibile in `uploads`, `cache`, `upgrade`.** È la singola regola che trasforma "upload arbitrario" in "nessuna conseguenza".
 - Dotfile (`.git`, `.env`, `.htaccess`, `.DS_Store`) → 404, con eccezione per `.well-known`.
-- `wp-config.php`, `readme.html`, `license.txt`, `install.php`, `debug.log` → 404.
+- `wp-config.php`, `readme.html`, `license.txt`, `debug.log` → 404.
 - File sorgente e di build (`.sql`, `.bak`, `.log`, `.ini`, `composer.json`, `package.json`…) → 404.
 - **Enumerazione utenti chiusa** su entrambe le vie: `/?author=1` → 403, `/wp-json/wp/v2/users` → 401 per gli anonimi (chi è loggato passa, al pannello serve).
+
+### **Installer**
+
+```
+WP_INSTALL_ACCESS=auto
+```
+
+`/wp-admin/install.php` e `/wp-admin/setup-config.php` su un sito installato vanno chiusi: sono la porta d'ingresso di chi trova un sito con il database vuoto e ci ripunta WordPress su un database proprio, diventando amministratore. Ma finché il sito **non** è installato sono l'unica strada per installarlo dal browser.
+
+Con `auto` (default) l'entrypoint decide ad ogni avvio guardando lo stato reale: `install.php` è raggiungibile finché le tabelle non esistono, `setup-config.php` finché manca `wp-config.php`. Appena il sito è installato, il riavvio successivo li richiude — e nel frattempo `install.php` risponde comunque "Già installato" senza toccare nulla. L'installer sta sotto lo stesso rate limit di `wp-login.php`.
+
+`deny` li chiude sempre (installazione solo da CLI, `wp core install`), `open` li lascia sempre raggiungibili.
 
 ### **XML-RPC**
 
