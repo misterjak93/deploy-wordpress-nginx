@@ -204,12 +204,14 @@ envsubst "${PHP_VARS}" < /opt/php-templates/pool.conf.template \
 
 TRUSTED_PROXY_LINES=""
 for _cidr in $(echo "${TRUSTED_PROXIES}" | tr ',' ' '); do
-    case "${_cidr}" in
-        *[!0-9./:abcdefABCDEF]*|"")
-            warn "TRUSTED_PROXIES contiene '${_cidr}', che non e' un indirizzo o una rete: ignorato."
-            continue
-            ;;
-    esac
+    # Non basta scartare i caratteri strani: "deadbeef" e' fatto di sole
+    # cifre esadecimali e passerebbe, per poi far fallire "nginx -t" e non
+    # far partire il container. Si pretende la forma di un indirizzo.
+    if [[ ! "${_cidr}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] \
+       && [[ ! "${_cidr}" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ || ! "${_cidr}" == *:* ]]; then
+        warn "TRUSTED_PROXIES contiene '${_cidr}', che non e' un indirizzo o una rete: ignorato."
+        continue
+    fi
     TRUSTED_PROXY_LINES="${TRUSTED_PROXY_LINES}    set_real_ip_from    ${_cidr};
 "
 done
