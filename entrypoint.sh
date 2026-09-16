@@ -94,10 +94,83 @@ update-alternatives --set php "/usr/bin/php${PHP_VER}" >/dev/null 2>&1 || \
 : "${RATE_LIMIT_API:=20}"
 : "${RATE_LIMIT_API_BURST:=40}"
 : "${XMLRPC_ENABLED:=0}"
-: "${CONVERTED_DIR:=compressx-nextgen}"
 : "${STATIC_BROWSER_TTL:=31536000}"
 : "${FIREWALL_ENABLED:=1}"
 : "${FIREWALL_BYPASS_COOKIE:=wpfw-bypass-CAMBIAMI}"
+
+# Cartella dove un plugin di conversione (CompressX, WebP Express) scrive
+# le varianti AVIF/WebP su disco. VUOTA per default: da quando c'e'
+# PageSpeed, AVIF e WebP li produce il modulo al volo guardando Accept, e
+# tenere in piedi anche la negoziazione su disco vorrebbe dire due strade
+# che fanno la stessa cosa - con il try_files che prova prima file che non
+# esistono. Si valorizza solo se PageSpeed e' spento o non licenziato.
+: "${CONVERTED_DIR:=}"
+
+# --- CORS degli asset serviti da nginx ---
+# Riguarda i font e gli asset statici, che un browser rifiuta di usare da
+# un altro dominio senza Access-Control-Allow-Origin. Vive qui e non nella
+# bacheca perche' un file servito con sendfile non sveglia PHP: il
+# mu-plugin non ha modo di metterci mano, e governa invece tutto cio' che
+# genera WordPress (pagine, REST API, admin-ajax, feed).
+#
+#   *              (default) chiunque puo' caricarli. E' il comportamento
+#                  storico di questo stack, ed e' innocuo: sono file
+#                  pubblici, senza cookie e senza credenziali.
+#   off            nessun header: gli asset si usano solo dal proprio sito.
+#   elenco         una o piu' origini separate da spazio o virgola. nginx
+#                  rimanda indietro l'origine solo se e' nell'elenco, e
+#                  aggiunge "Vary: Origin".
+#
+# "off" e' una parola e non il valore vuoto perche' il valore vuoto non
+# sopravvive al viaggio: Compose interpola "${CORS_STATIC_ORIGINS:-*}" e
+# un .env con la riga vuota arriva qui identico a un .env senza la riga.
+# Verificato facendolo: con la variabile vuota l'entrypoint riapplicava il
+# default e il CORS restava aperto, cioe' l'impostazione non si poteva
+# spegnere affatto.
+: "${CORS_STATIC_ORIGINS:=*}"
+
+# --- PageSpeed (ngx_pagespeed) ---
+# Il modulo c'e' solo se l'immagine e' stata costruita con
+# PAGESPEED_ENABLED=1. Qui si decide se accenderlo davvero: le direttive
+# vengono emesse solo dopo aver verificato che il .so esista, esattamente
+# come per Brotli e Zstandard.
+: "${PAGESPEED_ENABLED:=1}"
+
+# Livello di riscrittura. Vedi il commento nel template: qui davanti c'e'
+# una cache condivisa, quindi il default tocca i byte e non la struttura
+# dell'HTML.
+: "${PAGESPEED_REWRITE_LEVEL:=OptimizeForBandwidth}"
+
+# Filtri accesi in aggiunta al livello. I quattro di default sono la
+# conversione di formato: sono l'unica ragione per cui questo stack non ha
+# piu' bisogno di un plugin che generi AVIF e WebP su disco.
+: "${PAGESPEED_FILTERS:=convert_jpeg_to_webp,convert_to_webp_lossless,convert_jpeg_to_avif,convert_to_avif_lossless}"
+: "${PAGESPEED_DISABLE_FILTERS:=}"
+
+: "${PAGESPEED_CACHE_DIR:=/var/cache/nginx/pagespeed}"
+: "${PAGESPEED_CACHE_SIZE_KB:=1048576}"
+: "${PAGESPEED_IMAGE_QUALITY:=85}"
+: "${PAGESPEED_WEBP_QUALITY:=80}"
+: "${PAGESPEED_AVIF_QUALITY:=60}"
+: "${PAGESPEED_INPLACE:=on}"
+: "${PAGESPEED_ADMIN_PATH:=/pagespeed_admin}"
+: "${PAGESPEED_STATS_PATH:=/pagespeed_statistics}"
+
+# Invalidazione di Varnish quando PageSpeed finisce di ottimizzare una
+# pagina. Senza, la prima versione servita - quella ancora da ottimizzare -
+# resterebbe in cache fino alla scadenza del TTL.
+: "${PAGESPEED_DOWNSTREAM_PURGE:=1}"
+: "${PAGESPEED_DOWNSTREAM_THRESHOLD:=95}"
+
+# Percorsi che PageSpeed non deve toccare, oltre a quelli gia' esclusi
+# per default (amministrazione, REST API, feed, discovery).
+: "${PAGESPEED_DISALLOW:=}"
+
+# Direttive aggiuntive, una per riga, SENZA il prefisso "pagespeed" e
+# senza punto e virgola. E' anche il posto dove va la riga di attivazione
+# della licenza, che We-Amp documenta insieme al token: questo repository
+# non ne inventa il nome.
+: "${PAGESPEED_EXTRA_DIRECTIVES:=}"
 
 # --- Compressione ---
 : "${GZIP_LEVEL:=6}"
@@ -237,14 +310,86 @@ else
 fi
 export XMLRPC_DENY
 
+# --- CORS degli asset statici ---
+# Il valore finisce dentro alla configurazione di nginx, quindi si accetta
+# solo cio' che e' davvero un'origine: schema, host e al piu' una porta.
+# Un token con uno spazio o un punto e virgola sarebbe una direttiva in
+# piu'. In caso di dubbio si scarta quella voce e lo si dice nei log.
+CORS_ORIGIN_MAP=""
+CORS_MODE="off"
+case "${CORS_STATIC_ORIGINS}" in
+    ""|off|none|no)
+        CORS_MODE="off"
+        ;;
+    "*")
+        CORS_MODE="any"
+        ;;
+    *)
+        for _o in $(echo "${CORS_STATIC_ORIGINS}" | tr ',' ' '); do
+            if [[ ! "${_o}" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]]; then
+                warn "CORS_STATIC_ORIGINS contiene '${_o}', che non e' un'origine (schema://host[:porta]): ignorata."
+                continue
+            fi
+            CORS_ORIGIN_MAP="${CORS_ORIGIN_MAP}    \"${_o}\" \"${_o}\";
+"
+        done
+        if [ -n "${CORS_ORIGIN_MAP}" ]; then
+            CORS_MODE="list"
+        else
+            warn "CORS_STATIC_ORIGINS non contiene nessuna origine valida: nessun header CORS sugli asset."
+            CORS_MODE="off"
+        fi
+        ;;
+esac
+
+case "${CORS_MODE}" in
+    any)
+        CORS_STATIC_LINES='        add_header      Access-Control-Allow-Origin "*" always;'
+        ;;
+    list)
+        # "Vary: Origin" e' obbligatorio con un elenco: senza, Varnish
+        # servirebbe a tutti la risposta costruita per la prima origine
+        # che ha chiesto quel file. Il prezzo e' una copia in cache per
+        # origine, ed e' il motivo per cui "*" resta il default: su file
+        # pubblici non c'e' niente da proteggere.
+        CORS_STATIC_LINES='        add_header      Access-Control-Allow-Origin $cors_static_origin always;
+        add_header      Vary Origin always;'
+        ;;
+    *)
+        CORS_STATIC_LINES='        # CORS_STATIC_ORIGINS vuoto: nessun header CORS su questi file.'
+        ;;
+esac
+export CORS_STATIC_LINES
+
+# --- Negoziazione delle immagini su disco ---
+# Con CONVERTED_DIR vuoto il try_files si riduce all'originale: le
+# varianti le produce PageSpeed al volo, e nginx non deve cercare su disco
+# file che nessuno scrive.
+if [ -n "${CONVERTED_DIR}" ]; then
+    IMG_TRY_FILES="/wp-content/${CONVERTED_DIR}/\$img_path.\$img_ext\$img_avif
+                        /wp-content/${CONVERTED_DIR}/\$img_path.\$img_ext\$img_webp
+                        \$uri
+                        =404"
+    IMG_VARY_LINE='    add_header      Vary Accept;'
+else
+    IMG_TRY_FILES="\$uri =404"
+    IMG_VARY_LINE='    # Vary: Accept lo emette PageSpeed quando converte. Vedi CONVERTED_DIR.'
+fi
+export IMG_TRY_FILES IMG_VARY_LINE
+
 NGINX_VARS='${DOMAIN} ${WP_ROOT} ${WP_BASE} ${PHP_UPLOAD_LIMIT} ${PHP_MAX_EXECUTION_TIME}
 ${NGINX_WORKER_CONNECTIONS} ${LIMIT_CONN_PER_IP} ${RATE_LIMIT_LOGIN} ${RATE_LIMIT_LOGIN_BURST}
 ${RATE_LIMIT_XMLRPC} ${RATE_LIMIT_XMLRPC_BURST} ${RATE_LIMIT_API} ${RATE_LIMIT_API_BURST}
 ${XMLRPC_DENY} ${CONVERTED_DIR} ${STATIC_BROWSER_TTL} ${FIREWALL_BYPASS_COOKIE}
-${TRUSTED_PROXY_LINES}
+${TRUSTED_PROXY_LINES} ${CORS_STATIC_LINES} ${IMG_TRY_FILES} ${IMG_VARY_LINE}
 ${GZIP_LEVEL} ${BROTLI_LEVEL} ${ZSTD_LEVEL} ${COMPRESSION_MIN_LENGTH}
 ${FASTCGI_CACHE_DIR} ${FASTCGI_CACHE_ZONE_SIZE} ${FASTCGI_CACHE_MAX_SIZE}
-${FASTCGI_CACHE_INACTIVE} ${FASTCGI_CACHE_TTL}'
+${FASTCGI_CACHE_INACTIVE} ${FASTCGI_CACHE_TTL}
+${PAGESPEED_CACHE_DIR} ${PAGESPEED_CACHE_SIZE_KB} ${PAGESPEED_REWRITE_LEVEL}
+${PAGESPEED_FILTERS_LINE} ${PAGESPEED_DISABLE_LINE} ${PAGESPEED_INPLACE}
+${PAGESPEED_IMAGE_QUALITY} ${PAGESPEED_WEBP_QUALITY} ${PAGESPEED_AVIF_QUALITY}
+${PAGESPEED_ADMIN_PATH} ${PAGESPEED_STATS_PATH}
+${PAGESPEED_DOWNSTREAM_BLOCK} ${PAGESPEED_DISALLOW_BLOCK} ${PAGESPEED_EXTRA_BLOCK}'
 
 export FASTCGI_CACHE_DIR FASTCGI_CACHE_ZONE_SIZE FASTCGI_CACHE_MAX_SIZE \
        FASTCGI_CACHE_INACTIVE FASTCGI_CACHE_TTL
@@ -252,7 +397,10 @@ export DOMAIN WP_ROOT NGINX_WORKER_CONNECTIONS LIMIT_CONN_PER_IP \
        RATE_LIMIT_LOGIN RATE_LIMIT_LOGIN_BURST RATE_LIMIT_XMLRPC RATE_LIMIT_XMLRPC_BURST \
        RATE_LIMIT_API RATE_LIMIT_API_BURST CONVERTED_DIR STATIC_BROWSER_TTL \
        FIREWALL_BYPASS_COOKIE \
-       GZIP_LEVEL BROTLI_LEVEL ZSTD_LEVEL COMPRESSION_MIN_LENGTH
+       GZIP_LEVEL BROTLI_LEVEL ZSTD_LEVEL COMPRESSION_MIN_LENGTH \
+       PAGESPEED_CACHE_DIR PAGESPEED_CACHE_SIZE_KB PAGESPEED_REWRITE_LEVEL \
+       PAGESPEED_INPLACE PAGESPEED_IMAGE_QUALITY PAGESPEED_WEBP_QUALITY \
+       PAGESPEED_AVIF_QUALITY PAGESPEED_ADMIN_PATH PAGESPEED_STATS_PATH
 
 mkdir -p /etc/nginx/conf.d
 
@@ -333,6 +481,177 @@ for enc in $(echo "${COMPRESSION_PRIORITY:-br,zstd,gzip}" | tr ',' ' '); do
         *) warn "COMPRESSION_PRIORITY contiene '${enc}', che nginx non sa produrre: i client che lo annunciano riceveranno risposte non compresse." ;;
     esac
 done
+
+# --- CORS degli asset: la mappa ---
+# Il file si scrive sempre, anche vuoto di voci: nginx.conf lo include
+# sempre, e la location degli asset puo' riferirsi a $cors_static_origin.
+# Una mappa dichiarata e mai valorizzata non costa nulla; un include che
+# punta a un file inesistente impedisce l'avvio.
+{
+    cat <<'HEADER'
+# =======================================================
+# CORS degli asset statici - generato da entrypoint.sh
+# =======================================================
+# Riguarda solo i file che serve nginx (font, CSS, JavaScript, immagini).
+# Tutto cio' che genera WordPress - pagine, REST API, admin-ajax, feed -
+# lo governa il mu-plugin dalla scheda "Header e CORS", perche' li' la
+# politica puo' dipendere dal contenuto e cambiare senza ricaricare nginx.
+#
+# Con un elenco di origini la risposta varia per origine, quindi la
+# location aggiunge anche "Vary: Origin": senza, la prima origine che
+# chiede un file deciderebbe l'header per tutte le altre.
+HEADER
+    printf 'map $http_origin $cors_static_origin {\n    default "";\n'
+    printf '%s' "${CORS_ORIGIN_MAP}"
+    printf '}\n'
+} > /etc/nginx/snippets/cors.conf
+
+case "${CORS_MODE}" in
+    any)  log "CORS asset statici: aperto a tutti (CORS_STATIC_ORIGINS=*)." ;;
+    list) log "CORS asset statici: solo le origini elencate in CORS_STATIC_ORIGINS." ;;
+    *)    log "CORS asset statici: nessun header (CORS_STATIC_ORIGINS=off)." ;;
+esac
+
+envsubst "${NGINX_VARS}" < /etc/nginx/templates/image-negotiation.conf.template \
+    > /etc/nginx/snippets/image-negotiation.conf
+
+# =======================================================
+# 3-bis. PageSpeed
+# =======================================================
+# Stessa regola dei moduli di compressione: le direttive si emettono solo
+# dopo aver verificato che il modulo ci sia davvero. "pagespeed on" senza
+# il .so caricato non degrada l'ottimizzazione, fa fallire l'avvio con
+# "unknown directive" - cioe' sito giu'.
+#
+# In piu' qui il modulo si CARICA solo quando serve: sono circa 60 MB
+# mappati in ogni worker, che a PAGESPEED_ENABLED=0 sarebbero sprecati.
+PAGESPEED_MODULE_SO=/usr/lib/nginx/modules/ngx_pagespeed_module.so
+PAGESPEED_LOAD_FILE=/etc/nginx/modules-enabled/50-mod-pagespeed.conf
+PAGESPEED_ACTIVE=0
+
+if [ "${PAGESPEED_ENABLED}" = "1" ] && [ -f "${PAGESPEED_MODULE_SO}" ]; then
+    PAGESPEED_ACTIVE=1
+elif [ "${PAGESPEED_ENABLED}" = "1" ]; then
+    warn "PAGESPEED_ENABLED=1 ma il modulo non e' in questa immagine."
+    warn "         Ricostruiscila con --build-arg PAGESPEED_ENABLED=1, oppure metti PAGESPEED_ENABLED=0 nel .env."
+fi
+
+if [ "${PAGESPEED_ACTIVE}" = "1" ]; then
+    if [ -n "${PAGESPEED_FILTERS}" ]; then
+        PAGESPEED_FILTERS_LINE="pagespeed EnableFilters ${PAGESPEED_FILTERS//[[:space:]]/};"
+    else
+        PAGESPEED_FILTERS_LINE="# PAGESPEED_FILTERS vuoto: solo i filtri del livello qui sopra."
+    fi
+    if [ -n "${PAGESPEED_DISABLE_FILTERS}" ]; then
+        PAGESPEED_DISABLE_LINE="pagespeed DisableFilters ${PAGESPEED_DISABLE_FILTERS//[[:space:]]/};"
+    else
+        PAGESPEED_DISABLE_LINE="# PAGESPEED_DISABLE_FILTERS vuoto: nessun filtro tolto a mano."
+    fi
+
+    # Invalidazione di Varnish a ottimizzazione finita.
+    #
+    # La prima volta che una pagina passa di qui, PageSpeed la serve
+    # mentre sta ancora ottimizzando le risorse che contiene: quella
+    # versione, meno ottimizzata, e' anche quella che finisce in Varnish.
+    # Con questo blocco il modulo manda un PURGE quando ha finito, e la
+    # richiesta successiva rigenera la pagina completa.
+    #
+    # Il PURGE arriva dall'indirizzo di questo container, che e' esattamente
+    # cio' che l'ACL di Varnish elenca, e non ha virgole in X-Forwarded-For
+    # perche' non passa da Traefik: sono le due condizioni del VCL. La terza,
+    # PURGE_TOKEN, il modulo non la puo' soddisfare - vedi l'avviso sotto.
+    if [ "${PAGESPEED_DOWNSTREAM_PURGE}" = "1" ]; then
+        PAGESPEED_DOWNSTREAM_BLOCK="
+# --- Invalidazione della cache a valle (Varnish) ---
+pagespeed DownstreamCachePurgeLocationPrefix http://${VARNISH_HOST:-varnish}:80;
+pagespeed DownstreamCachePurgeMethod PURGE;
+pagespeed DownstreamCacheRewrittenPercentageThreshold ${PAGESPEED_DOWNSTREAM_THRESHOLD};"
+        if [ -n "${PURGE_TOKEN:-}" ]; then
+            warn "PURGE_TOKEN e' impostato: i PURGE di PageSpeed verso Varnish riceveranno 403."
+            warn "         Il modulo non sa mandare l'header X-Purge-Token. In cache resterebbe"
+            warn "         la prima versione della pagina, quella non ancora ottimizzata."
+            warn "         Scegli: o PURGE_TOKEN vuoto, o PAGESPEED_DOWNSTREAM_PURGE=0."
+        fi
+    else
+        PAGESPEED_DOWNSTREAM_BLOCK="
+# PAGESPEED_DOWNSTREAM_PURGE=0: Varnish non viene invalidato dal modulo."
+    fi
+
+    # Percorsi che non devono essere toccati. Sono gli stessi che i due
+    # livelli di cache gia' escludono: amministrazione, REST API in
+    # entrambe le forme di URL, feed, documenti di discovery. Elencarli
+    # anche qui non e' una ripetizione inutile - la' si decide se
+    # MEMORIZZARE, qui se RISCRIVERE, e riscrivere un JSON non ha senso in
+    # nessun caso.
+    PAGESPEED_DISALLOW_BLOCK="
+# --- Percorsi esclusi ---
+pagespeed Disallow \"*/wp-admin/*\";
+pagespeed Disallow \"*/wp-login.php*\";
+pagespeed Disallow \"*/wp-json/*\";
+pagespeed Disallow \"*rest_route=*\";
+pagespeed Disallow \"*/feed/*\";
+pagespeed Disallow \"*/.well-known/*\";
+pagespeed Disallow \"*/xmlrpc.php*\";"
+    for _p in ${PAGESPEED_DISALLOW}; do
+        case "${_p}" in
+            *[\"\;]*)
+                warn "PAGESPEED_DISALLOW contiene '${_p}', che chiuderebbe la direttiva: ignorato."
+                ;;
+            *)
+                PAGESPEED_DISALLOW_BLOCK="${PAGESPEED_DISALLOW_BLOCK}
+pagespeed Disallow \"${_p}\";"
+                ;;
+        esac
+    done
+
+    # Direttive extra dal .env, una per riga. Qui dentro passa anche la
+    # riga di attivazione della licenza.
+    if [ -n "${PAGESPEED_EXTRA_DIRECTIVES}" ]; then
+        PAGESPEED_EXTRA_BLOCK="
+# --- Direttive da PAGESPEED_EXTRA_DIRECTIVES ---"
+        while IFS= read -r _d; do
+            _d="${_d#"${_d%%[![:space:]]*}"}"
+            [ -z "${_d}" ] && continue
+            PAGESPEED_EXTRA_BLOCK="${PAGESPEED_EXTRA_BLOCK}
+pagespeed ${_d%;};"
+        done <<< "${PAGESPEED_EXTRA_DIRECTIVES}"
+    else
+        PAGESPEED_EXTRA_BLOCK="
+# PAGESPEED_EXTRA_DIRECTIVES vuoto."
+    fi
+
+    export PAGESPEED_FILTERS_LINE PAGESPEED_DISABLE_LINE \
+           PAGESPEED_DOWNSTREAM_BLOCK PAGESPEED_DISALLOW_BLOCK PAGESPEED_EXTRA_BLOCK
+
+    printf 'load_module modules/ngx_pagespeed_module.so;\n' > "${PAGESPEED_LOAD_FILE}"
+    envsubst "${NGINX_VARS}" < /etc/nginx/templates/pagespeed.conf.template \
+        > /etc/nginx/snippets/pagespeed.conf
+    envsubst "${NGINX_VARS}" < /etc/nginx/templates/pagespeed-locations.conf.template \
+        > /etc/nginx/snippets/pagespeed-locations.conf
+
+    log "PageSpeed attivo: livello ${PAGESPEED_REWRITE_LEVEL} | cache ${PAGESPEED_CACHE_DIR} ($(( PAGESPEED_CACHE_SIZE_KB / 1024 )) MB)"
+    [ -r /etc/stack-pagespeed-version ] && log "  modulo $(cat /etc/stack-pagespeed-version)"
+    if [ -z "${PAGESPEED_EXTRA_DIRECTIVES}" ]; then
+        warn "PageSpeed senza licenza: il modulo si carica e risponde, ma gira in pass-through"
+        warn "         e non ottimizza niente. La riga di attivazione del token va in"
+        warn "         PAGESPEED_EXTRA_DIRECTIVES. Senza, e con CONVERTED_DIR vuoto, nessuno"
+        warn "         produce AVIF o WebP."
+    fi
+else
+    # I due file devono esistere comunque: nginx.conf e il server block li
+    # includono sempre. Stesso schema della coppia fastcgi-cache*.conf.
+    rm -f "${PAGESPEED_LOAD_FILE}"
+    printf '# PageSpeed non attivo (PAGESPEED_ENABLED=%s).\n' "${PAGESPEED_ENABLED}" \
+        > /etc/nginx/snippets/pagespeed.conf
+    printf '# PageSpeed non attivo: nessuna location da dichiarare.\n' \
+        > /etc/nginx/snippets/pagespeed-locations.conf
+
+    if [ -z "${CONVERTED_DIR}" ]; then
+        warn "PageSpeed spento e CONVERTED_DIR vuoto: nessuno produce AVIF o WebP."
+        warn "         O accendi PAGESPEED_ENABLED, o rimetti un plugin di conversione"
+        warn "         (CompressX, WebP Express) e la sua cartella in CONVERTED_DIR."
+    fi
+fi
 
 if [ "${FIREWALL_ENABLED}" = "1" ]; then
     # Il cookie di bypass spegne TUTTO il firewall, quindi due cose devono
@@ -896,7 +1215,105 @@ fi
 # 7. Verifica della configurazione
 # =======================================================
 log "Verifica della configurazione nginx..."
+
+# PageSpeed e' l'unico pezzo di questa configurazione che arriva da un
+# pacchetto di terzi, quindi e' anche l'unico di cui non possiamo sapere
+# in anticipo se ogni direttiva esiste nella versione installata. Una
+# direttiva sconosciuta fa fallire l'avvio di nginx: sito giu' per una
+# ottimizzazione, che e' il rapporto sbagliato fra rischio e guadagno.
+#
+# Qui nginx -t viene quindi usato come oracolo: se si lamenta di una riga
+# di pagespeed.conf, quella riga viene commentata e si riprova. Se dopo
+# qualche giro non ne esce, PageSpeed si spegne del tutto e il sito parte
+# senza. In entrambi i casi la cosa e' scritta nei log e visibile nella
+# scheda PageSpeed della bacheca: il guasto che questo stack non tollera
+# e' quello silenzioso, non quello dichiarato.
+disattiva_pagespeed() {
+    rm -f "${PAGESPEED_LOAD_FILE}"
+    printf '# PageSpeed disattivato all%savvio: nginx ha rifiutato la configurazione.\n' "'" \
+        > /etc/nginx/snippets/pagespeed.conf
+    printf '# PageSpeed disattivato all%savvio: nessuna location da dichiarare.\n' "'" \
+        > /etc/nginx/snippets/pagespeed-locations.conf
+    PAGESPEED_ACTIVE=0
+}
+
+if [ "${PAGESPEED_ACTIVE}" = "1" ]; then
+    _tentativi=0
+    while [ "${_tentativi}" -lt 6 ]; do
+        NGINX_TEST_OUT="$(nginx -t 2>&1)" && break
+        _riga="$(printf '%s\n' "${NGINX_TEST_OUT}" \
+            | sed -n 's#.*/etc/nginx/snippets/pagespeed\.conf:\([0-9][0-9]*\).*#\1#p' | head -1)"
+        [ -z "${_riga}" ] && break
+        warn "PageSpeed: $(printf '%s\n' "${NGINX_TEST_OUT}" | grep -m1 -i 'emerg' || true)"
+        warn "         Riga scartata: $(sed -n "${_riga}p" /etc/nginx/snippets/pagespeed.conf)"
+        sed -i "${_riga}s|^|# scartata all'avvio: |" /etc/nginx/snippets/pagespeed.conf
+        _tentativi=$(( _tentativi + 1 ))
+    done
+
+    # L'esito si cattura in una variabile invece di mettere "nginx -t" in
+    # una pipe: con "set -o pipefail" una pipeline vale l'errore del
+    # comando che fallisce, quindi "nginx -t | grep pagespeed" risultava
+    # SEMPRE fallita proprio nel caso che qui interessa - quello in cui
+    # nginx -t fallisce - e la disattivazione non scattava mai.
+    NGINX_TEST_OUT="$(nginx -t 2>&1 || true)"
+    if printf '%s\n' "${NGINX_TEST_OUT}" | grep -qi 'is successful'; then
+        :
+    elif printf '%s\n' "${NGINX_TEST_OUT}" | grep -qi 'pagespeed'; then
+        warn "PageSpeed: nginx continua a rifiutare la configurazione. Lo disattivo e proseguo senza."
+        warn "         $(printf '%s\n' "${NGINX_TEST_OUT}" | grep -m1 -i 'emerg' || true)"
+        disattiva_pagespeed
+    fi
+fi
+
 nginx -t
+
+# --- Stato per la bacheca ---
+# Il mu-plugin gira dentro PHP e non puo' leggere la configurazione di
+# nginx: senza questo file dovrebbe indovinare, e una schermata di stato
+# che indovina e' peggio di una che non c'e'. Sta fuori dalla docroot -
+# accanto a logs/ e backups/ - quindi non e' scaricabile dal web.
+_json_esc() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\n'
+}
+_json_bool() { [ "$1" = "1" ] && printf 'true' || printf 'false'; }
+
+cat > "${WP_BASE}/stack-state.json" <<JSONEOF
+{
+  "generato": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "configurazione": "$( [ -r /etc/stack-config-version ] && cat /etc/stack-config-version || echo sconosciuta )",
+  "php": "${PHP_VER}",
+  "compressione": "$(_json_esc "${ACTIVE_ENCODINGS}")",
+  "static_browser_ttl": ${STATIC_BROWSER_TTL},
+  "converted_dir": "$(_json_esc "${CONVERTED_DIR}")",
+  "cors_statico": {
+    "modo": "${CORS_MODE}",
+    "origini": "$(_json_esc "${CORS_STATIC_ORIGINS}")"
+  },
+  "varnish_host": "$(_json_esc "${VARNISH_HOST:-varnish}")",
+  "purge_token": $(_json_bool "$( [ -n "${PURGE_TOKEN:-}" ] && echo 1 || echo 0 )"),
+  "pagespeed": {
+    "richiesto": $(_json_bool "${PAGESPEED_ENABLED}"),
+    "modulo_presente": $(_json_bool "$( [ -f "${PAGESPEED_MODULE_SO}" ] && echo 1 || echo 0 )"),
+    "attivo": $(_json_bool "${PAGESPEED_ACTIVE}"),
+    "versione": "$( [ -r /etc/stack-pagespeed-version ] && cat /etc/stack-pagespeed-version || echo '' )",
+    "livello": "$(_json_esc "${PAGESPEED_REWRITE_LEVEL}")",
+    "filtri": "$(_json_esc "${PAGESPEED_FILTERS}")",
+    "filtri_esclusi": "$(_json_esc "${PAGESPEED_DISABLE_FILTERS}")",
+    "cache_dir": "$(_json_esc "${PAGESPEED_CACHE_DIR}")",
+    "cache_size_kb": ${PAGESPEED_CACHE_SIZE_KB},
+    "qualita_immagini": ${PAGESPEED_IMAGE_QUALITY},
+    "qualita_webp": ${PAGESPEED_WEBP_QUALITY},
+    "qualita_avif": ${PAGESPEED_AVIF_QUALITY},
+    "admin_path": "$(_json_esc "${PAGESPEED_ADMIN_PATH}")",
+    "stats_path": "$(_json_esc "${PAGESPEED_STATS_PATH}")",
+    "purge_a_valle": $(_json_bool "${PAGESPEED_DOWNSTREAM_PURGE}"),
+    "soglia_purge": ${PAGESPEED_DOWNSTREAM_THRESHOLD},
+    "licenza_configurata": $(_json_bool "$( [ -n "${PAGESPEED_EXTRA_DIRECTIVES}" ] && echo 1 || echo 0 )")
+  }
+}
+JSONEOF
+chown www-data:www-data "${WP_BASE}/stack-state.json" 2>/dev/null || true
+chmod 644 "${WP_BASE}/stack-state.json"
 
 log "Verifica della configurazione PHP-FPM..."
 "/usr/sbin/php-fpm${PHP_VER}" -t

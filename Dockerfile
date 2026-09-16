@@ -117,6 +117,28 @@ FROM debian:${DEBIAN_CODENAME}-slim
 # Separatore virgola o spazio, indifferentemente.
 ARG PHP_VERSIONS="8.3,8.4,8.5"
 
+# Modulo PageSpeed (ngx_pagespeed) dentro l'immagine. A 0 il pacchetto non
+# viene installato affatto: l'immagine dimagrisce di ~60 MB e la variabile
+# PAGESPEED_ENABLED a runtime non ha piu' niente da accendere.
+#
+# Il pacchetto arriva da We-Amp (mod_pagespeed 1.15), che e' la
+# continuazione mantenuta del progetto che Google ha archiviato nel 2025.
+# La 2.0 non ha ancora un modulo nginx: si deploya come reverse proxy a se'
+# stante, e questo stack ha gia' Varnish davanti.
+ARG PAGESPEED_ENABLED=1
+
+# Versione del pacchetto. Vuoto = l'ultima pubblicata per questa release.
+#
+# Qui NON si pinna per default, al contrario dei due moduli di
+# compressione qui sopra, e la ragione e' che il vincolo vero lo dichiara
+# gia' il pacchetto: "Depends: nginx (>= 1.26.3), nginx (<< 1.26.4)". Un
+# modulo dinamico si carica solo nella versione ESATTA di nginx con cui e'
+# stato compilato, quindi apt rifiuta da solo la coppia sbagliata - una
+# garanzia piu' forte di uno SHA. Pinnare una revisione vecchia mentre
+# Debian aggiorna nginx renderebbe il build irrisolvibile invece che
+# corretto.
+ARG PAGESPEED_MODULE_VERSION=""
+
 ENV DEBIAN_FRONTEND=noninteractive \
     BUILD_PHP_VERSIONS="${PHP_VERSIONS}" \
     WP_BASE=/var/www/wordpress \
@@ -164,6 +186,55 @@ RUN set -eux; \
         ngx_http_zstd_static_module.so \
         > /etc/nginx/modules-enabled/10-compression.conf; \
     nginx -t -c /etc/nginx/nginx.conf
+
+# -------------------------------------------------------
+# 2-bis. PageSpeed (ngx_pagespeed)
+# -------------------------------------------------------
+# Il modulo si INSTALLA qui ma non si ATTIVA qui: il pacchetto lascia un
+# symlink in /etc/nginx/modules-enabled/ che caricherebbe il .so ad ogni
+# avvio, anche con PAGESPEED_ENABLED=0. Il symlink viene quindi spostato
+# fuori, e la riga "load_module" la scrive l'entrypoint solo quando serve
+# davvero - stessa regola dei moduli di compressione: le direttive di un
+# modulo solo se quel modulo c'e', e in piu' qui il modulo si carica solo
+# se qualcuno lo usa (sono 60 MB per worker).
+#
+# ngx_http_headers_module (add_header, expires) non compare da nessuna
+# parte perche' e' compilato dentro a nginx per default: lo step qui sotto
+# lo verifica invece di darlo per scontato, cosi' una nginx di
+# distribuzione compilata con "--without-http_headers_module" fermerebbe
+# il build invece di far uscire un sito senza header di sicurezza.
+RUN set -eux; \
+    nginx -V 2>&1 | grep -q -- '--without-http_headers_module' \
+        && { echo "ERRORE: questa nginx e' compilata senza ngx_http_headers_module: add_header non esiste."; exit 1; } \
+        || echo "ngx_http_headers_module: presente (compilato staticamente)."; \
+    if [ "${PAGESPEED_ENABLED}" = "1" ]; then \
+        apt-get update; \
+        apt-get install -y --no-install-recommends gpg; \
+        curl -fsSL https://packages.modpagespeed.com/pubkey.gpg -o /tmp/modpagespeed.asc; \
+        gpg --dearmor < /tmp/modpagespeed.asc > /usr/share/keyrings/modpagespeed-archive-keyring.gpg; \
+        rm -f /tmp/modpagespeed.asc; \
+        . /etc/os-release; \
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/modpagespeed-archive-keyring.gpg] https://packages.modpagespeed.com/apt ${VERSION_CODENAME} main" \
+            > /etc/apt/sources.list.d/modpagespeed.list; \
+        apt-get update; \
+        if [ -n "${PAGESPEED_MODULE_VERSION}" ]; then \
+            apt-get install -y --no-install-recommends "nginx-module-pagespeed=${PAGESPEED_MODULE_VERSION}"; \
+        else \
+            apt-get install -y --no-install-recommends nginx-module-pagespeed; \
+        fi; \
+        rm -f /etc/nginx/modules-enabled/50-mod-pagespeed.conf; \
+        test -f /usr/lib/nginx/modules/ngx_pagespeed_module.so; \
+        printf 'load_module modules/ngx_pagespeed_module.so;\n' \
+            > /etc/nginx/modules-enabled/50-mod-pagespeed.conf; \
+        nginx -t -c /etc/nginx/nginx.conf; \
+        rm -f /etc/nginx/modules-enabled/50-mod-pagespeed.conf; \
+        dpkg-query -W -f='${Version}' nginx-module-pagespeed > /etc/stack-pagespeed-version; \
+        echo "ngx_pagespeed $(cat /etc/stack-pagespeed-version) su nginx $(nginx -v 2>&1 | sed -n 's#.*nginx/##p')"; \
+        apt-get clean; \
+        rm -rf /var/lib/apt/lists/*; \
+    else \
+        echo "PAGESPEED_ENABLED=0: modulo PageSpeed non installato."; \
+    fi
 
 # -------------------------------------------------------
 # 3. PHP-FPM
@@ -275,7 +346,7 @@ COPY entrypoint.sh        /entrypoint.sh
 RUN set -eux; \
     chmod +x /entrypoint.sh /usr/local/bin/wp /usr/local/bin/*.sh; \
     mkdir -p /var/www/wordpress/html /var/www/wordpress/logs /run/php /var/lib/nginx \
-             /var/cache/nginx/wordpress; \
+             /var/cache/nginx/wordpress /var/cache/nginx/pagespeed; \
     chown -R www-data:www-data /var/www/wordpress /run/php /var/cache/nginx
 
 # Impronta della configurazione: i template e gli script nginx vivono

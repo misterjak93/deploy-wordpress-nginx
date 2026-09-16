@@ -97,6 +97,11 @@ services:
         # scegliere quale delle tre gira e' invece PHP_VERSION, che e'
         # solo runtime.
         PHP_VERSIONS: ${PHP_VERSIONS:-8.3,8.4,8.5}
+        # Se il modulo PageSpeed finisce nell'immagine. A 0 l'immagine
+        # dimagrisce di ~60 MB e PAGESPEED_ENABLED non ha piu' niente da
+        # accendere. Cambiarlo richiede rebuild, al contrario di
+        # PAGESPEED_ENABLED che e' solo runtime.
+        PAGESPEED_ENABLED: ${PAGESPEED_BUILD:-1}
     restart: unless-stopped
     expose:
       - "80"
@@ -155,9 +160,35 @@ services:
       # deducibile da dentro questo container.
       - TRUSTED_PROXIES=${TRUSTED_PROXIES:-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8}
 
-      # --- Immagini ---
-      - CONVERTED_DIR=${CONVERTED_DIR:-compressx-nextgen}
+      # --- Immagini e asset ---
+      # CONVERTED_DIR e' il ripiego su disco (CompressX, WebP Express) e
+      # per default e' vuoto: AVIF e WebP li genera PageSpeed al volo.
+      - CONVERTED_DIR=${CONVERTED_DIR:-}
       - STATIC_BROWSER_TTL=${STATIC_BROWSER_TTL:-31536000}
+      # CORS dei soli file serviti da nginx. Tutto cio' che genera
+      # WordPress lo governa il mu-plugin dalla bacheca.
+      - CORS_STATIC_ORIGINS=${CORS_STATIC_ORIGINS:-*}
+
+      # --- PageSpeed ---
+      # Il modulo sta nell'immagine (build arg PAGESPEED_ENABLED); qui si
+      # decide se accenderlo e come. Senza token di licenza gira in
+      # pass-through: si carica e non ottimizza. Vedi il .env.example.
+      - PAGESPEED_ENABLED=${PAGESPEED_ENABLED:-1}
+      - PAGESPEED_REWRITE_LEVEL=${PAGESPEED_REWRITE_LEVEL:-OptimizeForBandwidth}
+      - PAGESPEED_FILTERS=${PAGESPEED_FILTERS:-convert_jpeg_to_webp,convert_to_webp_lossless,convert_jpeg_to_avif,convert_to_avif_lossless}
+      - PAGESPEED_DISABLE_FILTERS=${PAGESPEED_DISABLE_FILTERS:-}
+      - PAGESPEED_IMAGE_QUALITY=${PAGESPEED_IMAGE_QUALITY:-85}
+      - PAGESPEED_WEBP_QUALITY=${PAGESPEED_WEBP_QUALITY:-80}
+      - PAGESPEED_AVIF_QUALITY=${PAGESPEED_AVIF_QUALITY:-60}
+      - PAGESPEED_CACHE_DIR=${PAGESPEED_CACHE_DIR:-/var/cache/nginx/pagespeed}
+      - PAGESPEED_CACHE_SIZE_KB=${PAGESPEED_CACHE_SIZE_KB:-1048576}
+      - PAGESPEED_INPLACE=${PAGESPEED_INPLACE:-on}
+      - PAGESPEED_ADMIN_PATH=${PAGESPEED_ADMIN_PATH:-/pagespeed_admin}
+      - PAGESPEED_STATS_PATH=${PAGESPEED_STATS_PATH:-/pagespeed_statistics}
+      - PAGESPEED_DOWNSTREAM_PURGE=${PAGESPEED_DOWNSTREAM_PURGE:-1}
+      - PAGESPEED_DOWNSTREAM_THRESHOLD=${PAGESPEED_DOWNSTREAM_THRESHOLD:-95}
+      - PAGESPEED_DISALLOW=${PAGESPEED_DISALLOW:-}
+      - PAGESPEED_EXTRA_DIRECTIVES=${PAGESPEED_EXTRA_DIRECTIVES:-}
 
       # --- Database e cache ---
       - DB_HOST=mariadb

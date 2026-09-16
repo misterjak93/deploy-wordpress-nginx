@@ -1,0 +1,40 @@
+# =======================================================
+# Immagini di wp-content - generato da entrypoint.sh
+# =======================================================
+# Questa location esiste sempre, anche quando non c'e' nessuna
+# negoziazione da fare: jpeg e png NON sono nella regex degli asset
+# statici, quindi senza di lei finirebbero in "location /", cioe' servite
+# senza la durata di cache lunga che si meritano.
+#
+# Chi produce AVIF e WebP puo' essere uno di due, e la differenza si vede
+# solo nel try_files qui sotto:
+#
+#   - PageSpeed, che converte al volo guardando l'header Accept e
+#     risponde "Vary: Accept" da se'. E' il caso normale da quando il
+#     modulo e' nello stack: niente cartella da riempire, niente plugin
+#     da tenere aggiornato, e le varianti stanno nella sua cache;
+#   - un plugin di conversione (CompressX, WebP Express), che scrive le
+#     varianti su disco accanto all'originale. Serve solo se PageSpeed e'
+#     spento o non licenziato: si accende valorizzando CONVERTED_DIR.
+#
+# "Vary: Accept" lo emette nginx solo nel secondo caso. Nel primo lo mette
+# gia' il modulo, e dichiararlo due volte lascerebbe "Vary: Accept, Accept"
+# in ogni oggetto di Varnish.
+location ~* ^/wp-content/(?<img_path>.+)\.(?<img_ext>jpe?g|png)$ {
+    # add_header non si eredita: dichiarandone di propri, questa location
+    # perdeva tutti quelli del server block (HSTS, Referrer-Policy,
+    # Permissions-Policy, le due Cross-Origin-*).
+    include         /etc/nginx/snippets/security-headers.conf;
+${IMG_VARY_LINE}
+    # Niente "immutable", al contrario della location degli asset: il nome
+    # di un file in uploads non cambia mai quando il file cambia. Chi
+    # sostituisce un'immagine - da FileBrowser, dalla libreria media, con
+    # un plugin di ottimizzazione - tiene lo stesso indirizzo, e
+    # "immutable" dice al browser di non ricontrollare nemmeno su ricarica
+    # forzata: sarebbe un anno di immagine vecchia che nessun purge di
+    # questo stack puo' raggiungere.
+    add_header      Cache-Control "public, max-age=${STATIC_BROWSER_TTL}";
+${CORS_STATIC_LINES}
+    access_log      off;
+    try_files       ${IMG_TRY_FILES};
+}

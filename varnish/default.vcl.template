@@ -143,6 +143,15 @@ sub vcl_recv {
         # dice chi l'ha scritta. Serve contro chi potesse falsificare
         # l'indirizzo di origine; senza segreto restano le prime due.
         # Il blocco lo scrive varnish-entrypoint.sh.
+        #
+        # ATTENZIONE: da quando c'e' PageSpeed, chi manda PURGE non e'
+        # piu' solo il mu-plugin. Il modulo ne manda uno quando ha finito
+        # di ottimizzare una pagina che aveva gia' servito - e' cosi' che
+        # la versione non ancora ottimizzata non resta in cache - e non
+        # sa mandare header propri. Con PURGE_TOKEN valorizzato quelle
+        # invalidazioni ricevono 403 e la pagina meno ottimizzata resta
+        # li' fino alla scadenza. L'entrypoint di WordPress lo segnala
+        # all'avvio; la scelta e' fra il token e quel purge.
 @PURGE_TOKEN_CHECK@
         if (req.method == "PURGE") {
             return (purge);
@@ -277,6 +286,29 @@ sub vcl_recv {
         || req.url ~ "^/wp-json(/|\?|$)"
         || req.url ~ "[?&]rest_route=") {
         set req.http.X-Stack-Bypass = "api";
+        return (pass);
+    }
+
+    # ---------------------------------------------------
+    # Endpoint di servizio di PageSpeed
+    # ---------------------------------------------------
+    # Il beacon e' il canale con cui il JavaScript del modulo racconta a
+    # nginx quali risorse sono davvero visibili nella pagina: e' una
+    # misura, non un contenuto, e in cache varrebbe zero. La console e le
+    # statistiche sono per definizione una fotografia dell'istante, e
+    # nginx le lascia raggiungere solo dalla rete interna.
+    #
+    # NON e' elencato "/pagespeed_static/", che invece va cachato
+    # volentieri: e' il JavaScript di supporto del modulo, uguale per
+    # tutti e con un'impronta nel nome.
+    #
+    # I percorsi sono quelli predefiniti. Cambiandoli con
+    # PAGESPEED_ADMIN_PATH o PAGESPEED_STATS_PATH questa regola non li
+    # riconosce piu': non e' un buco - da fuori quelle location
+    # rispondono comunque 403 - ma una copia in cache di una pagina di
+    # stato interna, ed e' meglio saperlo.
+    if (req.url ~ "^/(ngx_pagespeed_beacon|pagespeed_admin|pagespeed_global_admin|pagespeed_statistics|pagespeed_global_statistics)(/|\?|$)") {
+        set req.http.X-Stack-Bypass = "pagespeed";
         return (pass);
     }
 

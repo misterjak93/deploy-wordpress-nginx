@@ -90,6 +90,16 @@ server {
     include /etc/nginx/snippets/wordpress-hardening.conf;
 
     # -----------------------------------------------
+    # PageSpeed
+    # -----------------------------------------------
+    # Va incluso QUI, prima delle location degli asset: le regex sono
+    # valutate nell'ordine in cui compaiono, e una risorsa riscritta
+    # ("stile.css.pagespeed.cf.HASH.css") finirebbe nella regex degli
+    # statici, dove "try_files $uri =404" la cercherebbe su disco.
+    # Il file esiste sempre: e' vuoto quando PageSpeed e' spento.
+    include /etc/nginx/snippets/pagespeed-locations.conf;
+
+    # -----------------------------------------------
     # Rate limit sulle superfici di autenticazione
     # -----------------------------------------------
     location = /wp-login.php {
@@ -150,39 +160,12 @@ server {
     }
 
     # -----------------------------------------------
-    # Immagini: negoziazione AVIF/WebP + cache lunga
+    # Immagini: cache lunga e, se serve, negoziazione AVIF/WebP
     # -----------------------------------------------
-    # I plugin di conversione (CompressX, WebP Express, ...) scrivono le
-    # varianti accanto all'originale con il nome completo: foo.jpg.avif.
-    # try_files prova avif, poi webp, poi l'originale; se il browser non
-    # dichiara il formato la mappa restituisce suffisso vuoto e il primo
-    # tentativo coincide con l'originale.
-    #
-    # "Vary: Accept" e' obbligatorio: senza, Varnish (e qualunque CDN a
-    # monte) servirebbe l'AVIF anche a chi non lo sa leggere.
-    location ~* ^/wp-content/(?<img_path>.+)\.(?<img_ext>jpe?g|png)$ {
-        # add_header non si eredita: dichiarandone di propri, questa
-        # location perdeva tutti quelli del server block (HSTS,
-        # Referrer-Policy, Permissions-Policy, le due Cross-Origin-*).
-        # E' la regola scritta in testa allo snippet, che proprio le due
-        # location degli asset non rispettavano.
-        include         /etc/nginx/snippets/security-headers.conf;
-        add_header      Vary Accept;
-        # Niente "immutable" qui, al contrario della location degli asset
-        # qui sotto: il nome di un file in uploads non cambia mai quando
-        # il file cambia. Chi sostituisce un'immagine - da FileBrowser,
-        # dalla libreria media, con un plugin di ottimizzazione - tiene lo
-        # stesso indirizzo, e "immutable" dice al browser di non
-        # ricontrollare nemmeno su ricarica forzata. Sarebbe un anno di
-        # immagine vecchia che nessun purge di questo stack puo'
-        # raggiungere.
-        add_header      Cache-Control "public, max-age=${STATIC_BROWSER_TTL}";
-        access_log      off;
-        try_files       /wp-content/${CONVERTED_DIR}/$img_path.$img_ext$img_avif
-                        /wp-content/${CONVERTED_DIR}/$img_path.$img_ext$img_webp
-                        $uri
-                        =404;
-    }
+    # Il contenuto della location dipende da chi produce le varianti di
+    # nuova generazione - PageSpeed al volo, oppure un plugin di
+    # conversione che le scrive su disco - quindi la genera l'entrypoint.
+    include /etc/nginx/snippets/image-negotiation.conf;
 
     # -----------------------------------------------
     # Asset statici
@@ -211,7 +194,14 @@ server {
         # riempire il vuoto quando una risposta arriva senza
         # Cache-Control.
         add_header      Cache-Control "public, max-age=${STATIC_BROWSER_TTL}, immutable";
-        add_header      Access-Control-Allow-Origin "*";
+        # CORS degli asset: qui passano i font, che senza
+        # Access-Control-Allow-Origin un browser rifiuta di usare da un
+        # altro dominio. La politica arriva da CORS_STATIC_ORIGINS nel
+        # .env e non dalla bacheca: un file servito con sendfile non
+        # sveglia PHP, quindi il mu-plugin non ha modo di metterci mano.
+        # La scheda "Header e CORS" mostra il valore che sta girando, e
+        # governa invece tutto cio' che genera WordPress.
+${CORS_STATIC_LINES}
         tcp_nodelay     off;
         try_files       $uri =404;
     }

@@ -1,0 +1,126 @@
+# =======================================================
+# PageSpeed - contesto http - generato da entrypoint.sh
+# =======================================================
+# Il modulo e' ngx_pagespeed di We-Amp (mod_pagespeed 1.15), la
+# continuazione mantenuta del modulo che Google ha archiviato. Riscrive
+# HTML, CSS, JavaScript e immagini mentre escono da nginx, quindi lavora
+# DOPO la cache su disco (che memorizza la risposta grezza di PHP) e PRIMA
+# di Varnish, che si trova davanti e memorizza il risultato gia'
+# ottimizzato.
+#
+# Conseguenze di quella posizione, tutte volute:
+#
+#   - su un HIT di Varnish PageSpeed non gira affatto: il costo si paga
+#     una volta per pagina, non ad ogni visitatore;
+#   - su un HIT della cache su disco PageSpeed gira lo stesso, perche' i
+#     filtri di uscita di nginx lavorano anche sulle risposte servite
+#     dalla cache. E' il motivo per cui i filtri che cambiano la
+#     STRUTTURA dell'HTML restano opzionali e spenti per default;
+#   - le risorse riscritte hanno un'impronta nell'URL, quindi cambiano
+#     indirizzo quando cambia il contenuto: una pagina vecchia rimasta in
+#     un browser continua a funzionare, perche' PageSpeed serve comunque
+#     l'originale quando l'impronta non torna.
+
+pagespeed on;
+
+# Dove PageSpeed tiene le proprie risorse ottimizzate. Sta sotto
+# /var/cache/nginx, che e' un volume: sopravvive alla ricreazione del
+# container, come la cache di pagina.
+#
+# La directory la crea e ne corregge il proprietario il modulo stesso a
+# tempo di parsing della configurazione, quindi non serve mkdir qui.
+#
+# Non e' sorella di ${FASTCGI_CACHE_DIR} per caso: "Svuota tutto" del
+# mu-plugin rinomina la directory della cache di pagina in
+# ".purge-<nome>-<epoch>" e lascia la rimozione al cron. Quel glob cerca
+# ".purge-*", quindi questa directory non gli finisce mai fra i piedi.
+pagespeed FileCachePath ${PAGESPEED_CACHE_DIR};
+pagespeed FileCacheSizeKb ${PAGESPEED_CACHE_SIZE_KB};
+
+# Livello di riscrittura. "OptimizeForBandwidth" e' il livello che tocca
+# solo i BYTE: ricompressione delle immagini, minificazione di CSS e
+# JavaScript, ottimizzazione in place. Non sposta risorse, non cambia gli
+# URL, non riordina l'HTML.
+#
+# E' il default di questo stack per una ragione precisa: davanti c'e' una
+# cache condivisa. I livelli piu' aggressivi (CoreFilters) includono
+# filtri che adattano l'HTML al browser che ha chiesto la pagina, e una
+# pagina adattata a un browser finirebbe in Varnish e da li' a tutti gli
+# altri. Chi vuole quei filtri li accende sapendo cosa accende.
+pagespeed RewriteLevel ${PAGESPEED_REWRITE_LEVEL};
+${PAGESPEED_FILTERS_LINE}
+${PAGESPEED_DISABLE_LINE}
+
+# In-place resource optimization: ottimizza una risorsa lasciandola al suo
+# indirizzo, invece di pubblicarla a un URL nuovo. E' cio' che permette a
+# un tema di continuare a funzionare senza che nessun link cambi.
+pagespeed InPlaceResourceOptimization ${PAGESPEED_INPLACE};
+
+# Qualita' delle immagini. AVIF a 60 non e' "peggio" di WebP a 80: i due
+# encoder numerano scale diverse, e questi sono i default del modulo.
+pagespeed ImageRecompressionQuality ${PAGESPEED_IMAGE_QUALITY};
+pagespeed WebpRecompressionQuality ${PAGESPEED_WEBP_QUALITY};
+pagespeed AvifRecompressionQuality ${PAGESPEED_AVIF_QUALITY};
+
+# -------------------------------------------------------
+# Cache-Control ha un padrone solo, e non e' PageSpeed
+# -------------------------------------------------------
+# Con il default (on) PageSpeed riscrive i header di cache dell'HTML che
+# riscrive, tipicamente a "max-age=0, no-cache". Varnish tratta no-cache
+# come "non memorizzare": l'HTML smetterebbe di essere cachato del tutto,
+# cioe' si spegnerebbe il primo livello di cache di questo stack per
+# accendere un ottimizzatore.
+#
+# Il Cache-Control lo decide il mu-plugin, che e' l'unico dei livelli a
+# sapere se la pagina e' pubblica e che espone la durata come
+# impostazione della bacheca. Vedi la stessa regola nel VCL, dove Varnish
+# riempie il vuoto invece di riscrivere.
+pagespeed ModifyCachingHeaders off;
+
+# Rispetta Vary sulle risorse invece di ignorarlo (il default e' off).
+# Qui davanti c'e' una cache condivisa: una risorsa che dichiara di
+# variare e che venisse ottimizzata e servita a tutti sarebbe servita
+# alla meta' sbagliata del pubblico.
+pagespeed RespectVary on;
+
+# "Cache-Control: no-transform" da solo disattiva l'ottimizzazione per
+# quella risposta. E' il canale con cui il mu-plugin puo' togliere una
+# risposta a PageSpeed senza ricaricare nginx: vedi l'interruttore nella
+# scheda PageSpeed della bacheca.
+#
+# Attenzione se si tocca il mu-plugin: no-transform funziona solo da
+# SOLO. Combinato con altri valori ("public, max-age=0, no-transform")
+# il modulo lo ignora, ed e' un difetto noto a monte. Per questo il
+# plugin, quando spegne PageSpeed, emette no-transform da solo e affida
+# la scadenza al browser a un header Expires.
+pagespeed DisableRewriteOnNoTransform on;
+
+# -------------------------------------------------------
+# Invalidazione
+# -------------------------------------------------------
+# Senza questo, l'unico modo di svuotare la cache di PageSpeed sarebbe
+# cancellare la directory e riavviare nginx. Con, il mu-plugin la svuota
+# dal pulsante "Svuota tutto" e invalida il singolo indirizzo insieme a
+# Varnish e alla cache su disco.
+pagespeed EnableCachePurge on;
+
+# Console di amministrazione e statistiche del modulo. Sono le due fonti
+# da cui il mu-plugin legge lo stato vero (voci in cache, riscritture
+# riuscite, immagini convertite) invece di indovinarlo.
+#
+# Le location che le espongono sono in pagespeed-locations.conf e
+# rispondono solo alle chiamate interne: il modulo stesso avverte che una
+# ACL basata sulla stringa dell'URL e' aggirabile con //, /./ e %2e,
+# quindi il filtro sta su una location con match esatto, che nginx valuta
+# sull'URI gia' normalizzato.
+pagespeed AdminPath ${PAGESPEED_ADMIN_PATH};
+pagespeed StatisticsPath ${PAGESPEED_STATS_PATH};
+pagespeed MessageBufferSize 100000;
+
+# L'header che marca le risposte passate dal modulo. Serve a verificare
+# dal terminale che PageSpeed stia davvero lavorando, ed e' quello che il
+# mu-plugin interroga per dire se il modulo e' attivo o in pass-through.
+pagespeed XHeaderValue "PageSpeed";
+${PAGESPEED_DOWNSTREAM_BLOCK}
+${PAGESPEED_DISALLOW_BLOCK}
+${PAGESPEED_EXTRA_BLOCK}

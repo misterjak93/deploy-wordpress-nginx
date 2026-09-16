@@ -136,6 +136,12 @@ final class Stack_Cache {
 
 		add_action( 'init', array( $this, 'register_automations' ) );
 
+		// Header e CORS di cio' che genera WordPress. Si registra adesso e
+		// non su 'init' perche' una delle cose che fa e' TOGLIERE un
+		// filtro di WordPress (rest_send_cors_headers), e toglierlo va
+		// fatto prima che la REST API cominci a servire.
+		$this->register_headers();
+
 		if ( is_admin() ) {
 			add_action( 'admin_menu', array( $this, 'register_menu' ) );
 			add_action( 'admin_post_stack_cache_action', array( $this, 'handle_action' ) );
@@ -178,6 +184,38 @@ final class Stack_Cache {
 			'preload_enabled'  => true,
 			'preload_batch'    => 5,
 			'preload_on_purge' => true,
+
+			// --- PageSpeed ---
+			// L'interruttore non spegne il modulo (vive in nginx, che
+			// questo codice non puo' ricaricare): fa uscire le risposte
+			// con "Cache-Control: no-transform", che e' il modo
+			// documentato per dire a PageSpeed di non toccare QUESTA
+			// risposta. Vedi pagespeed_off_headers().
+			'pagespeed_enabled'     => true,
+			'pagespeed_purge'       => true,
+
+			// --- Header e CORS ---
+			// 'wordpress' lascia fare a WordPress, che sulla REST API
+			// risponde gia' a Origin con la sua logica. Le altre tre
+			// modalita' la sostituiscono.
+			'cors_mode'        => 'wordpress', // 'wordpress' | 'off' | 'list' | 'any'
+			'cors_origins'     => array(),
+			'cors_methods'     => 'GET, POST, OPTIONS',
+			'cors_headers'     => 'Authorization, Content-Type, X-WP-Nonce',
+			'cors_expose'      => 'X-WP-Total, X-WP-TotalPages, Link',
+			'cors_credentials' => false,
+			'cors_max_age'     => 600,
+			'cors_scope'       => array(
+				'rest'  => true,
+				'ajax'  => false,
+				'pages' => false,
+			),
+
+			'csp'             => '',
+			'csp_report_only' => true,
+			'headers_custom'  => array(),
+			'headers_remove'  => array(),
+
 			'automations'      => array(
 				'save_post'      => true,
 				'delete_post'    => true,
@@ -198,11 +236,27 @@ final class Stack_Cache {
 		if ( ! is_array( $saved ) ) {
 			$saved = array();
 		}
-		$merged = array_merge( self::defaults(), $saved );
-		$merged['automations'] = array_merge(
-			self::defaults()['automations'],
-			is_array( $saved['automations'] ?? null ) ? $saved['automations'] : array()
-		);
+		$defaults = self::defaults();
+		$merged   = array_merge( $defaults, $saved );
+
+		// Le chiavi annidate vanno unite a parte: array_merge sostituisce
+		// il sotto-array per intero, quindi un'automazione aggiunta in una
+		// versione successiva del plugin risulterebbe assente - non
+		// "attiva per default" - per chiunque avesse gia' salvato una
+		// volta le impostazioni.
+		foreach ( array( 'automations', 'cors_scope' ) as $nidificata ) {
+			$merged[ $nidificata ] = array_merge(
+				$defaults[ $nidificata ],
+				is_array( $saved[ $nidificata ] ?? null ) ? $saved[ $nidificata ] : array()
+			);
+		}
+
+		foreach ( array( 'cors_origins', 'headers_custom', 'headers_remove' ) as $lista ) {
+			if ( ! is_array( $merged[ $lista ] ?? null ) ) {
+				$merged[ $lista ] = array();
+			}
+		}
+
 		return $merged;
 	}
 
@@ -335,7 +389,15 @@ final class Stack_Cache {
 		// Cosa puo' farne il browser. Lo decide il plugin perche' e'
 		// l'unico dei tre livelli che sa se questa pagina e' pubblica: il
 		// VCL non riscrive piu' Cache-Control quando arriva dal backend.
-		header( 'Cache-Control: ' . $this->browser_cache_control() );
+		//
+		// L'unica eccezione e' l'interruttore di PageSpeed: quando e'
+		// spento, Cache-Control deve valere il solo "no-transform" o il
+		// modulo lo ignora. Vedi pagespeed_off_headers().
+		if ( ! $this->get( 'pagespeed_enabled' ) && $this->pagespeed_available() ) {
+			$this->pagespeed_off_headers();
+		} else {
+			header( 'Cache-Control: ' . $this->browser_cache_control() );
+		}
 
 		$this->send_validators();
 	}
@@ -621,6 +683,479 @@ final class Stack_Cache {
 		}
 
 		return $response;
+	}
+
+	// =========================================================
+	// Stato di nginx, letto invece che indovinato
+	// =========================================================
+
+	/**
+	 * Configurazione con cui nginx sta davvero girando.
+	 *
+	 * Il file lo scrive l'entrypoint alla fine dell'avvio, dopo che
+	 * "nginx -t" ha approvato la configurazione: contiene quindi lo stato
+	 * EFFETTIVO, non quello richiesto nel .env. La differenza conta: se
+	 * PageSpeed e' stato disattivato all'avvio perche' il modulo rifiutava
+	 * una direttiva, qui dentro "attivo" e' false, e la bacheca lo dice
+	 * invece di mostrare una schermata che descrive una cosa che non c'e'.
+	 *
+	 * Sta fuori dalla docroot, accanto a logs/ e backups/: non e'
+	 * scaricabile dal web.
+	 *
+	 * @return array<string,mixed>
+	 */
+	public function stack_state(): array {
+		static $state = null;
+		if ( null !== $state ) {
+			return $state;
+		}
+
+		$base = (string) ( getenv( 'WP_BASE' ) ?: '/var/www/wordpress' );
+		$file = rtrim( $base, '/' ) . '/stack-state.json';
+
+		$state = array();
+		if ( is_readable( $file ) ) {
+			$raw = json_decode( (string) file_get_contents( $file ), true );
+			if ( is_array( $raw ) ) {
+				$state = $raw;
+			}
+		}
+
+		return $state;
+	}
+
+	/** @return array<string,mixed> */
+	private function pagespeed_state(): array {
+		$ps = $this->stack_state()['pagespeed'] ?? array();
+		return is_array( $ps ) ? $ps : array();
+	}
+
+	/** Il modulo e' caricato e configurato in nginx? */
+	public function pagespeed_available(): bool {
+		return ! empty( $this->pagespeed_state()['attivo'] );
+	}
+
+	// =========================================================
+	// Livello 0: PageSpeed
+	// =========================================================
+	// Non e' una cache di pagina come le altre, ma una cache di RISORSE
+	// ottimizzate, e va invalidata insieme a loro: una pagina rigenerata
+	// che riusa un CSS vecchio e' lo stesso guasto di una pagina vecchia.
+
+	/**
+	 * Chiamata alla console del modulo, da dentro il container.
+	 *
+	 * Va a 127.0.0.1 con l'Host del sito, come il preload: la location che
+	 * espone la console risponde solo alle chiamate interne, e dall'URL
+	 * pubblico questa richiesta uscirebbe e rientrerebbe da Traefik -
+	 * diventando "esterna" e ricevendo 403.
+	 *
+	 * @return array{ok:bool, body:string, code:int}
+	 */
+	private function pagespeed_request( string $path ): array {
+		$res = wp_remote_get(
+			'http://127.0.0.1' . $path,
+			array(
+				'timeout'     => 5,
+				'sslverify'   => false,
+				'redirection' => 0,
+				'headers'     => array(
+					'Host'              => $this->site_host(),
+					'X-Forwarded-Proto' => 'https',
+				),
+			)
+		);
+
+		if ( is_wp_error( $res ) ) {
+			return array( 'ok' => false, 'body' => $res->get_error_message(), 'code' => 0 );
+		}
+
+		$code = (int) wp_remote_retrieve_response_code( $res );
+
+		return array(
+			'ok'   => $code >= 200 && $code < 400,
+			'body' => (string) wp_remote_retrieve_body( $res ),
+			'code' => $code,
+		);
+	}
+
+	private function pagespeed_admin_path(): string {
+		$p = (string) ( $this->pagespeed_state()['admin_path'] ?? '/pagespeed_admin' );
+		return '/' . ltrim( $p, '/' );
+	}
+
+	/**
+	 * Invalida una singola risorsa nella cache del modulo.
+	 *
+	 * Serve "EnableCachePurge on" nella configurazione di nginx, che
+	 * l'entrypoint scrive sempre quando PageSpeed e' attivo: senza,
+	 * l'endpoint risponde ma non cancella niente - l'ennesimo 200 che non
+	 * vuol dire "fatto".
+	 */
+	public function purge_pagespeed_url( string $url ): bool {
+		if ( ! $this->pagespeed_available() ) {
+			return false;
+		}
+
+		$r = $this->pagespeed_request(
+			$this->pagespeed_admin_path() . '/cache?purge=' . rawurlencode( $url )
+		);
+
+		return $r['ok'];
+	}
+
+	/** Svuota tutta la cache delle risorse ottimizzate. */
+	public function purge_pagespeed_all(): bool {
+		if ( ! $this->pagespeed_available() ) {
+			return false;
+		}
+
+		return $this->pagespeed_request( $this->pagespeed_admin_path() . '/cache?purge=*' )['ok'];
+	}
+
+	/**
+	 * Stato del modulo, misurato invece che dedotto.
+	 *
+	 * Le due domande sono diverse e vanno tenute separate:
+	 *
+	 *   - il modulo e' CARICATO? Lo dice il file di stato scritto
+	 *     dall'entrypoint dopo il via libera di "nginx -t";
+	 *   - il modulo sta OTTIMIZZANDO? Senza licenza il pacchetto gira in
+	 *     pass-through: si carica, risponde, e lascia passare il
+	 *     contenuto intatto. Lo si vede solo guardando una risposta vera,
+	 *     ed e' quello che fa questa funzione chiedendo la homepage a
+	 *     nginx e leggendo gli header che tornano indietro.
+	 *
+	 * @return array{ok:bool, detail:string, ottimizza:bool}
+	 */
+	public function pagespeed_status(): array {
+		$stato = $this->pagespeed_state();
+
+		if ( empty( $stato ) ) {
+			return array(
+				'ok'        => false,
+				'detail'    => 'stato di nginx non leggibile (container aggiornato di recente?)',
+				'ottimizza' => false,
+			);
+		}
+
+		if ( empty( $stato['modulo_presente'] ) ) {
+			return array(
+				'ok'        => false,
+				'detail'    => 'modulo non presente in questa immagine',
+				'ottimizza' => false,
+			);
+		}
+
+		if ( empty( $stato['attivo'] ) ) {
+			return array(
+				'ok'        => false,
+				'detail'    => ! empty( $stato['richiesto'] )
+					? 'richiesto ma disattivato all\'avvio: nginx ha rifiutato la configurazione'
+					: 'spento (PAGESPEED_ENABLED=0)',
+				'ottimizza' => false,
+			);
+		}
+
+		$res = wp_remote_get(
+			'http://127.0.0.1/',
+			array(
+				'timeout'     => 5,
+				'sslverify'   => false,
+				'redirection' => 0,
+				'headers'     => array(
+					'Host'              => $this->site_host(),
+					'X-Stack-Preload'   => '1',
+					'X-Forwarded-Proto' => 'https',
+					// Senza questo il modulo non ha nessuna ragione di
+					// convertire: la conversione la decide Accept.
+					'Accept'            => 'text/html,image/avif,image/webp,*/*',
+				),
+			)
+		);
+
+		$versione = (string) ( $stato['versione'] ?? '' );
+		$prefisso = '' !== $versione ? $versione . ' · ' : '';
+
+		if ( is_wp_error( $res ) ) {
+			return array(
+				'ok'        => true,
+				'detail'    => $prefisso . 'caricato (sonda non riuscita: ' . $res->get_error_message() . ')',
+				'ottimizza' => false,
+			);
+		}
+
+		$marcatore = (string) wp_remote_retrieve_header( $res, 'x-page-speed' );
+		$avviso    = (string) wp_remote_retrieve_header( $res, 'x-pagespeed-warn' );
+
+		if ( '' !== $avviso ) {
+			return array(
+				'ok'        => true,
+				'detail'    => $prefisso . 'senza licenza (' . $avviso . ')',
+				'ottimizza' => false,
+			);
+		}
+
+		if ( '' === $marcatore ) {
+			return array(
+				'ok'        => true,
+				'detail'    => $prefisso . 'caricato, ma le risposte non passano dai filtri: pass-through, di solito perche' . "'" . ' manca la licenza',
+				'ottimizza' => false,
+			);
+		}
+
+		return array(
+			'ok'        => true,
+			'detail'    => $prefisso . 'sta ottimizzando (' . $marcatore . ')',
+			'ottimizza' => true,
+		);
+	}
+
+	/**
+	 * Header che tolgono questa risposta a PageSpeed.
+	 *
+	 * "no-transform" e' il modo documentato per dire a un intermediario di
+	 * non trasformare il contenuto, e il modulo lo rispetta. C'e' pero'
+	 * una trappola nota a monte: lo rispetta solo se Cache-Control vale
+	 * ESATTAMENTE quello. "public, max-age=0, no-transform" viene ignorato.
+	 *
+	 * Per questo qui Cache-Control diventa il solo no-transform e la
+	 * politica per il browser passa su Expires, che dice la stessa cosa
+	 * con un header piu' vecchio. I due livelli di cache non ne
+	 * risentono: leggono X-Accel-Expires e X-WP-Varnish-TTL, che restano.
+	 */
+	private function pagespeed_off_headers(): void {
+		header( 'Cache-Control: no-transform' );
+		header( 'Expires: ' . gmdate( 'D, d M Y H:i:s', time() - 3600 ) . ' GMT' );
+	}
+
+	// =========================================================
+	// Header e CORS
+	// =========================================================
+	// Quello che nginx aggiunge con add_header vale per i file che serve
+	// lui e per tutte le risposte, ma e' scritto nell'immagine: cambiarlo
+	// e' un redeploy. Quello che decide questo blocco vale per cio' che
+	// genera WordPress - pagine, REST API, admin-ajax - e cambia con un
+	// salvataggio, perche' e' l'unico livello che sa CHE COSA sta
+	// rispondendo.
+	//
+	// I due non si sovrappongono di proposito: gli header di sicurezza
+	// (X-Frame-Options, Referrer-Policy, ...) restano in
+	// security-headers.conf, la CSP e gli header personalizzati vivono
+	// qui. Emettere lo stesso header da entrambe le parti significherebbe
+	// consegnarlo due volte, perche' add_header di nginx AGGIUNGE e non
+	// sostituisce.
+
+	public function register_headers(): void {
+		$mode  = (string) $this->get( 'cors_mode', 'wordpress' );
+		$scope = (array) $this->get( 'cors_scope', array() );
+
+		// Pagine del sito: CSP, header personalizzati, rimozioni e, se
+		// richiesto, CORS.
+		add_action( 'send_headers', array( $this, 'on_send_headers' ), 20 );
+
+		if ( 'wordpress' !== $mode ) {
+			// Il filtro di WordPress risponderebbe a Origin per conto suo,
+			// e i due header si sommerebbero: "Access-Control-Allow-Origin"
+			// due volte e' un errore CORS, non una politica piu' larga.
+			// Si puo' togliere da qui perche' i must-use plugin vengono
+			// caricati dopo default-filters.php.
+			if ( ! empty( $scope['rest'] ) ) {
+				remove_filter( 'rest_pre_serve_request', 'rest_send_cors_headers' );
+			}
+		}
+
+		add_filter( 'rest_pre_serve_request', array( $this, 'on_rest_serve' ), 20, 1 );
+
+		if ( ! empty( $scope['ajax'] ) && 'wordpress' !== $mode ) {
+			add_action( 'admin_init', array( $this, 'on_ajax_headers' ), 1 );
+			// Il preflight di admin-ajax non lo gestisce nessuno in
+			// WordPress: la richiesta OPTIONS arriva senza "action" e
+			// riceve 400, quindi il browser non manda mai la POST vera.
+			// Qui si risponde prima, e solo se l'origine e' ammessa.
+			add_action( 'init', array( $this, 'maybe_preflight' ), 1 );
+		}
+	}
+
+	/**
+	 * L'origine della richiesta corrente, se ammessa dalla politica.
+	 *
+	 * Restituisce null quando non c'e' niente da rispondere: nessun
+	 * Origin, politica spenta, origine non in elenco. In quel caso non si
+	 * emette nessun header - "Access-Control-Allow-Origin: null" e'
+	 * un'origine valida per la specifica, non un rifiuto.
+	 */
+	private function cors_origin(): ?string {
+		$mode = (string) $this->get( 'cors_mode', 'wordpress' );
+		if ( 'off' === $mode || 'wordpress' === $mode ) {
+			return null;
+		}
+
+		$origin = (string) ( $_SERVER['HTTP_ORIGIN'] ?? '' );
+		if ( '' === $origin ) {
+			return null;
+		}
+
+		$origin = esc_url_raw( $origin );
+		if ( '' === $origin ) {
+			return null;
+		}
+
+		if ( 'any' === $mode ) {
+			// Con le credenziali attive il jolly non e' ammesso dalla
+			// specifica: si rimanda indietro l'origine vera, che e'
+			// equivalente per il browser e legale.
+			return $this->get( 'cors_credentials' ) ? $origin : '*';
+		}
+
+		$ammesse = array_map(
+			static fn( $o ): string => untrailingslashit( strtolower( (string) $o ) ),
+			(array) $this->get( 'cors_origins', array() )
+		);
+
+		return in_array( untrailingslashit( strtolower( $origin ) ), $ammesse, true ) ? $origin : null;
+	}
+
+	/** Emette gli header CORS per la richiesta corrente. */
+	private function send_cors_headers(): void {
+		$origin = $this->cors_origin();
+		if ( null === $origin ) {
+			return;
+		}
+
+		header( 'Access-Control-Allow-Origin: ' . $origin );
+
+		// Vary: Origin e' obbligatorio appena la risposta dipende
+		// dall'origine, ed e' il motivo per cui la REST API non finisce
+		// comunque in cache: senza, la prima origine che chiede quella
+		// rotta deciderebbe l'header per tutte le altre.
+		if ( '*' !== $origin ) {
+			header( 'Vary: Origin', false );
+		}
+
+		if ( $this->get( 'cors_credentials' ) ) {
+			header( 'Access-Control-Allow-Credentials: true' );
+		}
+
+		$expose = trim( (string) $this->get( 'cors_expose', '' ) );
+		if ( '' !== $expose ) {
+			header( 'Access-Control-Expose-Headers: ' . $expose );
+		}
+
+		if ( 'OPTIONS' === strtoupper( (string) ( $_SERVER['REQUEST_METHOD'] ?? '' ) ) ) {
+			header( 'Access-Control-Allow-Methods: ' . (string) $this->get( 'cors_methods', 'GET, POST, OPTIONS' ) );
+			header( 'Access-Control-Allow-Headers: ' . (string) $this->get( 'cors_headers', '' ) );
+			header( 'Access-Control-Max-Age: ' . (int) $this->get( 'cors_max_age', 600 ) );
+		}
+	}
+
+	/** Preflight di admin-ajax: si risponde e si chiude. */
+	public function maybe_preflight(): void {
+		if ( ! wp_doing_ajax() ) {
+			return;
+		}
+		if ( 'OPTIONS' !== strtoupper( (string) ( $_SERVER['REQUEST_METHOD'] ?? '' ) ) ) {
+			return;
+		}
+		if ( null === $this->cors_origin() ) {
+			return;
+		}
+
+		$this->send_cors_headers();
+		header( 'Cache-Control: no-store' );
+		status_header( 204 );
+		exit;
+	}
+
+	public function on_ajax_headers(): void {
+		if ( ! wp_doing_ajax() ) {
+			return;
+		}
+		$this->send_cors_headers();
+	}
+
+	/**
+	 * @param mixed $served
+	 * @return mixed
+	 */
+	public function on_rest_serve( mixed $served ): mixed {
+		if ( ! empty( ( (array) $this->get( 'cors_scope', array() ) )['rest'] ) ) {
+			$this->send_cors_headers();
+		}
+		$this->apply_header_rules( false );
+
+		return $served;
+	}
+
+	public function on_send_headers(): void {
+		if ( ! empty( ( (array) $this->get( 'cors_scope', array() ) )['pages'] ) ) {
+			$this->send_cors_headers();
+		}
+		$this->apply_header_rules( true );
+	}
+
+	/**
+	 * CSP, header personalizzati e rimozioni.
+	 *
+	 * @param bool $con_csp La CSP esce solo sull'HTML del sito: applicarla
+	 *                      alla REST API non protegge niente (una risposta
+	 *                      JSON non esegue script) e rompe i client che
+	 *                      leggono gli header.
+	 */
+	private function apply_header_rules( bool $con_csp ): void {
+		if ( headers_sent() ) {
+			return;
+		}
+
+		foreach ( (array) $this->get( 'headers_remove', array() ) as $nome ) {
+			$nome = self::clean_header_name( (string) $nome );
+			if ( '' !== $nome ) {
+				header_remove( $nome );
+			}
+		}
+
+		foreach ( (array) $this->get( 'headers_custom', array() ) as $riga ) {
+			$nome   = self::clean_header_name( (string) ( $riga['name'] ?? '' ) );
+			$valore = self::clean_header_value( (string) ( $riga['value'] ?? '' ) );
+			if ( '' === $nome || '' === $valore ) {
+				continue;
+			}
+			header( $nome . ': ' . $valore );
+		}
+
+		if ( ! $con_csp ) {
+			return;
+		}
+
+		$csp = self::clean_header_value( (string) $this->get( 'csp', '' ) );
+		if ( '' === $csp ) {
+			return;
+		}
+
+		header(
+			( $this->get( 'csp_report_only' )
+				? 'Content-Security-Policy-Report-Only: '
+				: 'Content-Security-Policy: ' ) . $csp
+		);
+	}
+
+	/**
+	 * Un nome di header e' fatto solo di questi caratteri.
+	 *
+	 * Non e' pignoleria: il valore arriva da un campo di testo della
+	 * bacheca e finisce dentro a header(). Un ritorno a capo in mezzo
+	 * significa una riga di header in piu' scritta da chi ha compilato il
+	 * campo - e con essa, per esempio, un Set-Cookie.
+	 */
+	public static function clean_header_name( string $nome ): string {
+		$nome = trim( $nome );
+		return preg_match( '/^[A-Za-z0-9-]{1,120}$/', $nome ) ? $nome : '';
+	}
+
+	/** Come sopra, dal lato del valore: niente CR, LF o byte di controllo. */
+	public static function clean_header_value( string $valore ): string {
+		$valore = trim( preg_replace( '/[\x00-\x1F\x7F]+/', ' ', $valore ) ?? '' );
+		return mb_substr( $valore, 0, 2000 );
 	}
 
 	// =========================================================
@@ -1112,10 +1647,14 @@ final class Stack_Cache {
 	 */
 	public function purge_all(): array {
 		$result = array(
-			'varnish' => $this->purge_varnish_all(),
-			'nginx'   => $this->purge_nginx_all(),
-			'redis'   => $this->purge_redis(),
-			'opcache' => $this->purge_opcache(),
+			'varnish'   => $this->purge_varnish_all(),
+			'nginx'     => $this->purge_nginx_all(),
+			'redis'     => $this->purge_redis(),
+			'opcache'   => $this->purge_opcache(),
+			// Le risorse ottimizzate sono l'unico livello che non contiene
+			// pagine: se restassero, una pagina rigenerata continuerebbe a
+			// caricare il CSS di prima.
+			'pagespeed' => $this->purge_pagespeed_all(),
 		);
 
 		// La copia che sta nel browser del visitatore non la raggiunge
@@ -1164,10 +1703,20 @@ final class Stack_Cache {
 		$this->defer();
 	}
 
-	/** Invalida una singola pagina su entrambi i livelli, subito. */
+	/** Invalida una singola pagina su tutti i livelli, subito. */
 	public function purge_url_now( string $url ): void {
 		$this->purge_varnish_url( $url );
 		$this->purge_nginx_url( $url );
+
+		// Anche la copia ottimizzata di quella pagina. E' opzionale
+		// perche' su un sito molto movimentato ogni purge e' una chiamata
+		// in piu', e il modulo si accorge da solo dei contenuti cambiati
+		// alla prima richiesta successiva: qui si guadagna il tempo fra
+		// le due cose, non la correttezza.
+		if ( $this->get( 'pagespeed_purge' ) ) {
+			$this->purge_pagespeed_url( $url );
+		}
+
 		do_action( 'stack_cache_purged_url', $url );
 	}
 
@@ -1619,12 +2168,19 @@ final class Stack_Cache {
 			case 'purge_all':
 				$r       = $this->purge_all();
 				$message = sprintf(
-					'Cache svuotata. Varnish: %s · nginx: %s · Redis: %s · OPcache: %s',
+					'Cache svuotata. Varnish: %s · nginx: %s · Redis: %s · OPcache: %s · PageSpeed: %s',
 					$r['varnish'] ? 'ok' : 'non raggiungibile',
 					$this->nginx_purge_detail( $r['nginx'] ),
 					$r['redis'] ? 'ok' : 'non attiva',
-					$r['opcache'] ? 'ok' : 'non disponibile'
+					$r['opcache'] ? 'ok' : 'non disponibile',
+					$r['pagespeed'] ? 'ok' : 'non attivo'
 				);
+				break;
+
+			case 'purge_pagespeed':
+				$message = $this->purge_pagespeed_all()
+					? 'Risorse ottimizzate di PageSpeed invalidate.'
+					: 'PageSpeed non e\' attivo, oppure la console non ha risposto.';
 				break;
 
 			case 'purge_varnish':
@@ -1668,35 +2224,149 @@ final class Stack_Cache {
 		}
 
 		set_transient( 'stack_cache_notice', $message, 60 );
-		wp_safe_redirect( admin_url( 'admin.php?page=' . self::MENU_SLUG ) );
+
+		// Si torna alla scheda da cui si e' partiti: dopo aver salvato le
+		// automazioni, ritrovarsi sullo stato fa sembrare che il
+		// salvataggio non sia avvenuto.
+		$tab = sanitize_key( (string) ( $_REQUEST['tab'] ?? '' ) );
+		$url = admin_url( 'admin.php?page=' . self::MENU_SLUG );
+		if ( '' !== $tab ) {
+			$url = add_query_arg( 'tab', $tab, $url );
+		}
+
+		wp_safe_redirect( $url );
 		exit;
 	}
 
+	/**
+	 * Salva la scheda che e' stata inviata, e solo quella.
+	 *
+	 * Da quando la schermata e' divisa in schede, ogni form manda i campi
+	 * di una scheda sola. Ripartire dai valori predefiniti - come faceva
+	 * la versione precedente, quando il form era uno - azzererebbe tutte
+	 * le altre: salvare i TTL avrebbe spento le automazioni, e nulla lo
+	 * avrebbe segnalato. Si parte quindi dalle impostazioni correnti e si
+	 * applicano i soli campi della scheda inviata, che e' anche il motivo
+	 * per cui le caselle non spuntate delle ALTRE schede non vengono
+	 * lette come "disattivate".
+	 */
 	private function save_settings(): void {
 		$in  = wp_unslash( $_POST );
-		$new = self::defaults();
+		$tab = sanitize_key( (string) ( $in['tab'] ?? '' ) );
+		$new = $this->settings;
 
-		$new['enabled']          = ! empty( $in['enabled'] );
-		$new['cache_404']        = ! empty( $in['cache_404'] );
-		$new['cache_feed']       = ! empty( $in['cache_feed'] );
-		$new['preload_enabled']  = ! empty( $in['preload_enabled'] );
-		$new['preload_on_purge'] = ! empty( $in['preload_on_purge'] );
-		$new['validators']       = ! empty( $in['validators'] );
+		// Un form senza campo "tab" e' il form unico, quello che manda
+		// tutte le sezioni insieme: si applicano tutte. Vale anche come
+		// rete di sicurezza per una scheda futura che si dimenticasse il
+		// campo nascosto - in quel caso si salva piu' del necessario, che
+		// e' l'errore innocuo dei due. L'errore da non fare e' il
+		// contrario: leggere come "disattivate" le caselle di una scheda
+		// che non e' stata nemmeno inviata.
+		$sezioni = '' !== $tab
+			? array( $tab )
+			: array( 'cache', 'browser', 'automazioni', 'preload' );
 
-		$new['ttl_nginx']     = max( 0, (int) ( $in['ttl_nginx'] ?? 0 ) );
-		$new['ttl_varnish']   = max( 0, (int) ( $in['ttl_varnish'] ?? 0 ) );
-		$new['ttl_feed']      = max( 0, (int) ( $in['ttl_feed'] ?? 0 ) );
-		$new['ttl_404']       = max( 0, (int) ( $in['ttl_404'] ?? 0 ) );
-		$new['ttl_browser']   = max( 0, (int) ( $in['ttl_browser'] ?? 0 ) );
-		$new['preload_batch'] = max( 1, min( 50, (int) ( $in['preload_batch'] ?? 5 ) ) );
+		foreach ( $sezioni as $sezione ) {
+			switch ( $sezione ) {
+				case 'cache':
+					$new['enabled']     = ! empty( $in['enabled'] );
+					$new['cache_404']   = ! empty( $in['cache_404'] );
+					$new['cache_feed']  = ! empty( $in['cache_feed'] );
+					$new['ttl_nginx']   = max( 0, (int) ( $in['ttl_nginx'] ?? 0 ) );
+					$new['ttl_varnish'] = max( 0, (int) ( $in['ttl_varnish'] ?? 0 ) );
+					$new['ttl_feed']    = max( 0, (int) ( $in['ttl_feed'] ?? 0 ) );
+					$new['ttl_404']     = max( 0, (int) ( $in['ttl_404'] ?? 0 ) );
+					break;
 
-		$new['purge_scope'] = 'all' === ( $in['purge_scope'] ?? '' ) ? 'all' : 'related';
+				case 'browser':
+					$new['validators']  = ! empty( $in['validators'] );
+					$new['ttl_browser'] = max( 0, (int) ( $in['ttl_browser'] ?? 0 ) );
+					break;
 
-		$autos = array();
-		foreach ( array_keys( self::defaults()['automations'] ) as $key ) {
-			$autos[ $key ] = ! empty( $in['automations'][ $key ] );
+				case 'automazioni':
+					$new['purge_scope'] = 'all' === ( $in['purge_scope'] ?? '' ) ? 'all' : 'related';
+					$autos              = array();
+					foreach ( array_keys( self::defaults()['automations'] ) as $key ) {
+						$autos[ $key ] = ! empty( $in['automations'][ $key ] );
+					}
+					$new['automations'] = $autos;
+					break;
+
+				case 'preload':
+					$new['preload_enabled']  = ! empty( $in['preload_enabled'] );
+					$new['preload_on_purge'] = ! empty( $in['preload_on_purge'] );
+					$new['preload_batch']    = max( 1, min( 50, (int) ( $in['preload_batch'] ?? 5 ) ) );
+					break;
+
+				case 'pagespeed':
+					$new['pagespeed_enabled'] = ! empty( $in['pagespeed_enabled'] );
+					$new['pagespeed_purge']   = ! empty( $in['pagespeed_purge'] );
+					break;
+
+				case 'header':
+					$modo = (string) ( $in['cors_mode'] ?? 'wordpress' );
+					$new['cors_mode'] = in_array( $modo, array( 'wordpress', 'off', 'list', 'any' ), true )
+						? $modo
+						: 'wordpress';
+
+					// Le origini si normalizzano adesso, non ad ogni
+					// richiesta: il confronto sul percorso caldo deve essere
+					// una ricerca in un array, non una passata di esc_url_raw.
+					$origini = array();
+					foreach ( preg_split( '/[\r\n,]+/', (string) ( $in['cors_origins'] ?? '' ) ) ?: array() as $o ) {
+						$o = untrailingslashit( trim( (string) $o ) );
+						if ( '' === $o ) {
+							continue;
+						}
+						// Un'origine e' schema + host + porta. Tutto il resto
+						// (percorso, query) non compare mai nell'header Origin
+						// di un browser, quindi accettarlo vorrebbe solo dire
+						// non riconoscere mai quell'origine.
+						if ( preg_match( '#^https?://[A-Za-z0-9.\-]+(:\d{1,5})?$#', $o ) ) {
+							$origini[] = strtolower( $o );
+						}
+					}
+					$new['cors_origins'] = array_values( array_unique( $origini ) );
+
+					$new['cors_methods']     = self::clean_header_value( (string) ( $in['cors_methods'] ?? '' ) );
+					$new['cors_headers']     = self::clean_header_value( (string) ( $in['cors_headers'] ?? '' ) );
+					$new['cors_expose']      = self::clean_header_value( (string) ( $in['cors_expose'] ?? '' ) );
+					$new['cors_credentials'] = ! empty( $in['cors_credentials'] );
+					$new['cors_max_age']     = max( 0, min( 86400, (int) ( $in['cors_max_age'] ?? 600 ) ) );
+
+					$scope = array();
+					foreach ( array_keys( self::defaults()['cors_scope'] ) as $key ) {
+						$scope[ $key ] = ! empty( $in['cors_scope'][ $key ] );
+					}
+					$new['cors_scope'] = $scope;
+
+					$new['csp']             = self::clean_header_value( (string) ( $in['csp'] ?? '' ) );
+					$new['csp_report_only'] = ! empty( $in['csp_report_only'] );
+
+					$custom = array();
+					$nomi   = (array) ( $in['header_name'] ?? array() );
+					$valori = (array) ( $in['header_value'] ?? array() );
+					foreach ( $nomi as $i => $nome ) {
+						$nome   = self::clean_header_name( (string) $nome );
+						$valore = self::clean_header_value( (string) ( $valori[ $i ] ?? '' ) );
+						if ( '' === $nome || '' === $valore ) {
+							continue;
+						}
+						$custom[] = array( 'name' => $nome, 'value' => $valore );
+					}
+					$new['headers_custom'] = array_slice( $custom, 0, 20 );
+
+					$rimossi = array();
+					foreach ( preg_split( '/[\r\n,]+/', (string) ( $in['headers_remove'] ?? '' ) ) ?: array() as $nome ) {
+						$nome = self::clean_header_name( (string) $nome );
+						if ( '' !== $nome ) {
+							$rimossi[] = $nome;
+						}
+					}
+					$new['headers_remove'] = array_values( array_unique( $rimossi ) );
+					break;
 		}
-		$new['automations'] = $autos;
+		}
 
 		update_option( self::OPTION, $new );
 		$this->settings = $this->load_settings();

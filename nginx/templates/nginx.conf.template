@@ -161,6 +161,19 @@ ${TRUSTED_PROXY_LINES}
     include /etc/nginx/snippets/maps.conf;
     include /etc/nginx/snippets/cache-maps.conf;
     include /etc/nginx/snippets/firewall-8g.conf;
+    # CORS degli asset serviti da nginx: la mappa dipende dall'elenco di
+    # origini nel .env, quindi la genera l'entrypoint.
+    include /etc/nginx/snippets/cors.conf;
+
+    # -----------------------------------------------
+    # PageSpeed
+    # -----------------------------------------------
+    # Ottimizzazione di HTML, CSS, JavaScript e immagini in uscita da
+    # nginx (AVIF e WebP compresi). Il file esiste sempre: e' vuoto
+    # quando il modulo non c'e' o PAGESPEED_ENABLED e' 0, perche' una
+    # direttiva "pagespeed" senza il modulo caricato non degrada niente -
+    # fa fallire l'avvio con "unknown directive", cioe' sito giu'.
+    include /etc/nginx/snippets/pagespeed.conf;
 
     include /etc/nginx/conf.d/*.conf;
 }

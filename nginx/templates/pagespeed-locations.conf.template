@@ -1,0 +1,83 @@
+# =======================================================
+# PageSpeed - location - generato da entrypoint.sh
+# =======================================================
+# Incluso in cima al server block, PRIMA della location degli asset
+# statici, e l'ordine non e' estetico: le location con espressione
+# regolare vengono valutate nell'ordine in cui compaiono, e
+# "stile.css.pagespeed.cf.HASH.css" finisce nella regex degli statici,
+# dove la regola e' "try_files $uri =404". Una risorsa riscritta non
+# esiste su disco - la genera il modulo - quindi risponderebbe 404: il
+# sito resterebbe in piedi ma senza CSS.
+
+# Risorse riscritte da PageSpeed. Il nome porta dentro di se' l'impronta
+# del contenuto, quindi l'indirizzo cambia quando cambia il file.
+#
+# "add_header "" """ e' la riga che il pacchetto stesso suggerisce:
+# azzera gli header ereditati dal livello superiore, che qui
+# descriverebbero l'originale e non la risorsa generata. Da qui in poi
+# vale la regola di sempre di questo stack - dichiarando un add_header
+# proprio, la location perde tutti quelli del server block - quindi gli
+# header di sicurezza vanno rimessi esplicitamente.
+location ~ "\.pagespeed\.([a-z]\.)?[a-z]{2}\.[^.]{10}\.[^.]+" {
+    add_header "" "";
+    include         /etc/nginx/snippets/security-headers.conf;
+    access_log      off;
+    log_not_found   off;
+}
+
+# JavaScript di supporto servito dal modulo (lazy loading, beacon).
+location ~ "^/pagespeed_static/" {
+    include         /etc/nginx/snippets/security-headers.conf;
+    access_log      off;
+}
+
+# Endpoint di beaconing: lo chiama il JavaScript del modulo per dire
+# quali risorse sono davvero visibili. Non e' contenuto e non deve finire
+# in nessuna cache.
+location ~ "^/ngx_pagespeed_beacon$" {
+    include         /etc/nginx/snippets/security-headers.conf;
+    access_log      off;
+}
+
+# -------------------------------------------------------
+# Console e statistiche: solo dalla rete interna
+# -------------------------------------------------------
+# Il pacchetto avverte che filtrare questi percorsi su una stringa di URL
+# (in un WAF, al bordo) e' aggirabile con "//pagespeed_admin",
+# "/./pagespeed_admin" o "%2e". La location di nginx no: nginx normalizza
+# l'URI prima di scegliere la location, quindi il filtro va fatto qui.
+#
+# "^~" e non una regex perche' la console ha sottopercorsi
+# (/cache, /statistics) e perche' un prefisso con "^~" batte le regex che
+# compaiono piu' in basso.
+#
+# Il controllo e' lo stesso di /healthz: $client_interno guarda chi ha
+# davvero aperto la connessione e quanti indirizzi ci sono in
+# X-Forwarded-For, non $remote_addr, che il client puo' influenzare.
+# "deny" da solo non basterebbe se un domani questa location rispondesse
+# con "return": allow/deny agisce nella fase di access, che viene dopo.
+location ^~ ${PAGESPEED_ADMIN_PATH} {
+    if ($client_interno = 0) {
+        return 403;
+    }
+    allow           127.0.0.0/8;
+    allow           10.0.0.0/8;
+    allow           172.16.0.0/12;
+    allow           192.168.0.0/16;
+    deny            all;
+    access_log      off;
+    include         /etc/nginx/snippets/security-headers.conf;
+}
+
+location ^~ ${PAGESPEED_STATS_PATH} {
+    if ($client_interno = 0) {
+        return 403;
+    }
+    allow           127.0.0.0/8;
+    allow           10.0.0.0/8;
+    allow           172.16.0.0/12;
+    allow           192.168.0.0/16;
+    deny            all;
+    access_log      off;
+    include         /etc/nginx/snippets/security-headers.conf;
+}
