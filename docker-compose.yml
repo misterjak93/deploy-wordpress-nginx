@@ -157,6 +157,7 @@ services:
 
       # --- Immagini ---
       - CONVERTED_DIR=${CONVERTED_DIR:-compressx-nextgen}
+      - STATIC_BROWSER_TTL=${STATIC_BROWSER_TTL:-31536000}
 
       # --- Database e cache ---
       - DB_HOST=mariadb

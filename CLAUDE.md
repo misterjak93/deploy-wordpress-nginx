@@ -616,6 +616,139 @@ Verificato contando le generazioni di pagina, non gli header: backend che
 emette un marcatore diverso ad ogni risposta, nginx e Varnish avviati uno
 davanti all'altro, e tre richieste per URL.
 
+### La regola vale per tutta la REST API, non per un elenco di percorsi
+
+La prima versione di quella regola elencava `/wp-json/mcp/...` e gli
+endpoint OAuth. Elencare percorsi significa dover indovinare in anticipo
+come un plugin installato domani chiamerà le proprie rotte — e sbagliare
+in silenzio. Il buco più grosso era in piena vista: **l'indice delle
+rotte**, cioè `/wp-json/` stesso, che è esattamente il documento da cui
+un client impara gli indirizzi, non era in nessuno dei due elenchi e
+restava in cache come una pagina qualunque.
+
+Ora l'esclusione copre tutta la REST API in entrambe le forme di URL, in
+tre posti che devono dire la stessa cosa: `vcl_recv`, `$cache_skip_uri` e
+`Stack_Cache::rest_no_store()`.
+
+Il costo va detto: una REST API pubblica e molto trafficata (un front-end
+headless) non guadagna più niente dalla RAM. Sotto restano OPcache e
+l'object cache Redis.
+
+### Una richiesta REST non esegue nessun gancio di pagina
+
+È la ragione per cui il mu-plugin non poteva accorgersene da solo.
+`rest_api_loaded()` è agganciata a `parse_request`, serve la risposta e
+chiama `die()`: `send_headers` e `template_redirect` non vengono **mai**
+eseguiti. Ogni risposta REST usciva quindi senza `X-Accel-Expires` e
+senza `X-WP-Varnish-TTL`, e i due livelli applicavano i propri default —
+`FASTCGI_CACHE_TTL` su nginx, trenta giorni.
+
+Nemmeno l'invalidazione avrebbe rimediato: `purge_post()` conosce
+permalink, archivi e feed, non le rotte REST che li espongono. Le voci
+restavano fino a `inactive`.
+
+Il punto di aggancio è `rest_post_dispatch`, che è l'ultimo filtro che
+ogni risposta attraversa — comprese quelle di errore.
+
+### `send_headers` scatta prima che la query sia partita
+
+`WP::main()` esegue in quest'ordine: `parse_request()`, `send_headers()`,
+`query_posts()`, `handle_404()`. Su `send_headers` la query principale
+non è ancora partita, quindi `is_404()`, `is_feed()`, `is_search()`,
+`is_singular()` e le condizionali di WooCommerce rispondono tutte
+**false**.
+
+Il plugin ci era agganciato, e dichiarava quindi "pagina pubblica" —
+trenta giorni di TTL su nginx — anche per un 404, per una ricerca o per
+il carrello. Le mappe di nginx ne fermavano una parte ed è l'unica
+ragione per cui il guasto non si è mai visto.
+
+Il gancio giusto è `template_redirect`, a query conclusa e prima di
+qualunque output. È anche il primo punto in cui l'oggetto interrogato
+esiste, quindi senza di lui non si potrebbe calcolare un `Last-Modified`.
+La priorità è alta (1000) per stare **dopo** `redirect_canonical`, che su
+un 301 chiude la risposta e chiama `exit`.
+
+### Le richieste condizionali non arrivano a PHP, e non devono
+
+Con la cache FastCGI attiva, nginx **toglie** `If-None-Match` e
+`If-Modified-Since` prima di parlare con il backend e risponde lui dal
+proprio archivio. Lo stesso fa Varnish su un HIT. Misurato con due header
+sonda stampati da PHP: `assente` entrambi con la cache accesa, presenti
+con `fastcgi_cache off`.
+
+Non è un problema, è il risultato migliore possibile: un 304 servito
+senza svegliare PHP. Ma cambia il senso di `Last-Modified` ed `ETag`
+emessi dal plugin — **servono ai due livelli davanti**, non a sé stesso.
+Il ramo che risponde 304 dentro al plugin resta la strada per quando la
+cache su disco è spenta, e va tenuto funzionante.
+
+Conseguenza pratica: `if_modified_since` in nginx era al default
+`exact`, che risponde 304 solo se la data coincide **al secondo**. Un
+client con una copia più vecchia della nostra, o con l'orologio avanti,
+si riprendeva il corpo intero. Ora è `before`, che è la semantica della
+RFC. Verificato: stessa richiesta, 200 con `exact` e 304 con `before`.
+
+### L'ETag è debole di proposito, e contiene il contatore di generazione
+
+Debole (`W/`) perché fra PHP e il visitatore il corpo viene ricompresso da
+nginx in gzip, brotli o zstd: un ETag forte smetterebbe di descrivere i
+byte consegnati davvero. Il modulo gzip lo degrada da sé, gli altri due
+non necessariamente; dichiararlo debole da subito toglie la discrepanza,
+e per una richiesta condizionale il confronto debole è comunque quello
+giusto.
+
+Il contatore (`stack_cache_generation`) sale ad **ogni svuotamento
+totale** ed entra nell'impronta. Senza, il pulsante "Svuota tutto" direbbe
+di aver svuotato la cache mentre una parte del pubblico continua a
+rivedere la pagina vecchia dal proprio disco: la copia nel browser è
+l'unico livello che nessun PURGE raggiunge. Le invalidazioni mirate non lo
+toccano — la data di modifica del contenuto cambia da sola, e alzarlo per
+un articolo scaderebbe i validatori di tutto il sito.
+
+### Il `Last-Modified` di una pagina singola include l'ultimo commento
+
+Un commento cambia la pagina senza toccare `post_modified` di un secondo.
+Senza quella riga, un lettore che ha già visto l'articolo riceve 304 e non
+vede **mai** i commenti nuovi — di nuovo un guasto silenzioso, e di nuovo
+in una cache. La query è una sola riga su una colonna indicizzata e gira
+solo quando la pagina la si sta generando davvero, cioè quando entrambe le
+cache hanno già fatto MISS.
+
+Su un archivio il valore è il più recente fra i contenuti mostrati, non
+`get_lastpostmodified()`: quello è il ripiego per quando il loop è vuoto.
+E il risultato è sempre limitato a `time()`, perché un contenuto
+programmato darebbe una data nel futuro, che per la RFC è invalida.
+
+### `Cache-Control` ha un padrone solo, e non è il VCL
+
+Il VCL riscriveva `Cache-Control` su ogni risposta cacheabile. Con il
+`Cache-Control` deciso ora dal mu-plugin — che è l'unico dei tre livelli a
+sapere se la pagina è pubblica, e che espone la durata come impostazione
+della bacheca — quella riga avrebbe reso il campo della bacheca una bugia
+silenziosa.
+
+Adesso il VCL **riempie il vuoto** invece di riscrivere: `if
+(!beresp.http.Cache-Control)`. Vale anche per gli statici, la cui durata
+vive in `STATIC_BROWSER_TTL` dentro alle due location di nginx: due numeri
+da tenere allineati a mano sono due numeri che prima o poi divergono.
+
+Corollario: `s-maxage` resta **fisso a zero** e non segue il TTL di
+Varnish. Varnish il proprio TTL se lo prende da `X-WP-Varnish-TTL`;
+`s-maxage` parlerebbe a una CDN eventualmente davanti a Traefik, che non
+sappiamo invalidare.
+
+### `immutable` non va sulle immagini di `uploads`
+
+Su CSS e JavaScript sì: WordPress li pubblica con `?ver=`, quindi una
+modifica cambia l'indirizzo e quello vecchio non verrà più chiesto.
+
+Il nome di un file in `uploads` invece non cambia **mai** quando il file
+cambia, e `immutable` dice al browser di non ricontrollare nemmeno su
+ricarica forzata. Chi sostituisce un'immagine — da FileBrowser, dalla
+libreria media, con un plugin di ottimizzazione — si troverebbe un anno di
+immagine vecchia che nessun purge di questo stack può raggiungere.
+
 ---
 
 ## Storico
@@ -787,6 +920,45 @@ forma «la cache risponde qualcosa che non è un errore» — solo che
 stavolta l'errore c'è ed è visibile. Chi usa un plugin di invalidazione
 di terze parti non lo vedrebbe comunque: per questo il token è
 facoltativo e il caso è scritto nel `.env.example`.
+
+### Il terzo livello di cache, e la REST API che non doveva essercene
+
+Giro nato da una richiesta semplice — "aggiungiamo `Last-Modified`,
+`ETag` e la gestione della cache del browser" — e da un sospetto del
+proprietario: *il mu-plugin fa la cache delle richieste alle REST API, e
+la connessione a Claude via MCP è instabile*.
+
+Il sospetto era esatto, e la causa non era quella. Il mu-plugin non
+faceva niente sulle richieste REST: **non veniva eseguito affatto**,
+perché nessuno dei suoi ganci scatta su quel percorso. Le risposte
+uscivano quindi senza istruzioni e i due livelli applicavano i propri
+default, trenta giorni su nginx. L'esclusione aggiunta nel giro
+precedente copriva `/wp-json/mcp/...` e gli endpoint OAuth, ma non
+l'indice delle rotte da cui un client li impara.
+
+Cercando dove agganciare il calcolo del `Last-Modified` è emerso il
+secondo difetto, indipendente e più vecchio: il plugin era agganciato a
+`send_headers`, che scatta **prima** che la query principale sia partita.
+Tutte le sue condizionali — 404, feed, ricerca, singolo, carrello —
+rispondevano `false`, e ogni risposta veniva dichiarata "pagina pubblica".
+
+Tre header in uscita sono spariti perché in produzione non servono a
+nessuno: `X-Cache-Hits`, `X-WP-Cache-Reason` e i due `Link` che WordPress
+emette su ogni pagina.
+
+Verificato facendo girare le cose, non leggendole: nginx, PHP-FPM e
+Varnish installati e avviati uno davanti all'altro, con un backend che
+stampa un marcatore diverso ad ogni esecuzione. Contate le esecuzioni di
+PHP, non gli header: tre richieste a una pagina danno una sola
+generazione, tre richieste alla stessa rotta REST ne danno tre. Il 304 lo
+serve Varnish in `HIT` senza toccare nginx; con `fastcgi_cache off`
+risponde il plugin, e due header sonda stampati da PHP dimostrano che è
+nginx a togliere `If-None-Match` quando la cache è accesa. `immutable`
+esce su `stile.css` e non su `uploads/foto.jpg`.
+
+Un dettaglio trovato solo perché misurato: `if_modified_since` al default
+`exact` rispondeva **200** a un `If-Modified-Since` di un mese più
+recente del `Last-Modified`.
 
 ---
 

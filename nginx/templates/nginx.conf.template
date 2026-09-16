@@ -95,6 +95,29 @@ ${TRUSTED_PROXY_LINES}
     open_file_cache_errors      off;
 
     # -----------------------------------------------
+    # Richieste condizionali
+    # -----------------------------------------------
+    # Il default di nginx e' "exact": risponde 304 solo se la data in
+    # If-Modified-Since coincide al secondo con il Last-Modified della
+    # risposta. Qualunque data PIU' RECENTE - quella che manda un client
+    # che ha la pagina da prima, o che ha l'orologio avanti - viene
+    # trattata come "non l'ho mai vista" e si riprende il corpo intero.
+    #
+    # "before" e' la semantica della RFC: se la copia del client non e'
+    # piu' vecchia della nostra, 304. Misurato: con "exact" un
+    # If-Modified-Since di un mese posteriore riceveva 200 e 93 KB,
+    # con "before" riceve 304 e nulla.
+    #
+    # Vale per le risposte che nginx serve dalla propria cache di pagina e
+    # per i file statici. Le richieste condizionali non arrivano affatto a
+    # PHP quando la cache FastCGI e' attiva: nginx toglie If-None-Match e
+    # If-Modified-Since prima di parlare con il backend e risponde lui.
+    # E' il motivo per cui il mu-plugin emette ETag e Last-Modified anche
+    # se la sua logica di 304 non scatta quasi mai: servono a nginx e a
+    # Varnish, non a se stesso.
+    if_modified_since           before;
+
+    # -----------------------------------------------
     # Compressione
     # -----------------------------------------------
     # Zstandard, Brotli e gzip insieme. Il file e' generato

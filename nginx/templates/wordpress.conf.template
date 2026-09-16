@@ -168,7 +168,15 @@ server {
         # location degli asset non rispettavano.
         include         /etc/nginx/snippets/security-headers.conf;
         add_header      Vary Accept;
-        add_header      Cache-Control "public, max-age=31536000, immutable";
+        # Niente "immutable" qui, al contrario della location degli asset
+        # qui sotto: il nome di un file in uploads non cambia mai quando
+        # il file cambia. Chi sostituisce un'immagine - da FileBrowser,
+        # dalla libreria media, con un plugin di ottimizzazione - tiene lo
+        # stesso indirizzo, e "immutable" dice al browser di non
+        # ricontrollare nemmeno su ricarica forzata. Sarebbe un anno di
+        # immagine vecchia che nessun purge di questo stack puo'
+        # raggiungere.
+        add_header      Cache-Control "public, max-age=${STATIC_BROWSER_TTL}";
         access_log      off;
         try_files       /wp-content/${CONVERTED_DIR}/$img_path.$img_ext$img_avif
                         /wp-content/${CONVERTED_DIR}/$img_path.$img_ext$img_webp
@@ -192,7 +200,17 @@ server {
         # Niente "expires": emetterebbe un secondo Cache-Control accanto a
         # questo, e i due valori non coinciderebbero (expires non sa dire
         # immutable). Un solo header, esplicito.
-        add_header      Cache-Control "public, max-age=31536000, immutable";
+        #
+        # "immutable" si puo' dire qui e non sulle immagini perche' questi
+        # indirizzi sono versionati: WordPress accoda ?ver= alla versione
+        # del tema o del plugin, quindi una modifica cambia l'URL invece
+        # del contenuto di quello vecchio.
+        #
+        # Il TTL arriva dal .env (STATIC_BROWSER_TTL) ed e' l'unico posto
+        # in cui e' scritto: il VCL non lo riscrive piu', si limita a
+        # riempire il vuoto quando una risposta arriva senza
+        # Cache-Control.
+        add_header      Cache-Control "public, max-age=${STATIC_BROWSER_TTL}, immutable";
         add_header      Access-Control-Allow-Origin "*";
         tcp_nodelay     off;
         try_files       $uri =404;
